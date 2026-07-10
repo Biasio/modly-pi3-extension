@@ -1,0 +1,2 @@
+# Preserve upstream formatting in vendored Pi3 sources.
+pi3_vendor/** -whitespace

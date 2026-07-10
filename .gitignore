@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime environments
+.venv/
+venv/
+env/
+
+# Modly/runtime artifacts
+/.modly/
+/models/
+/outputs/
+/tmp/
+*.ply
+*.glb
+*.obj
+*.log
+
+# Local/editor files
+.DS_Store
+.idea/
+.vscode/
+/.pi3-runtime/
+/build/
+/dist/
+/workspace/
+*.safetensors
+*.ckpt
+*.pt
+*.pth

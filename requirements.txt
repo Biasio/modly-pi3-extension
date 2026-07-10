@@ -1,0 +1,9 @@
+# torch/torchvision are installed by setup.py with an explicit PyTorch wheel index.
+# Default Pi3 lane: torch==2.5.1/torchvision==0.20.1; GB10/sm_12x lane: torch==2.7.0/torchvision==0.22.0 cu128.
+# flash-attn is installed/probed separately by setup.py so local wheelhouse and source-build policy can be hardware-aware.
+numpy==1.26.4
+pillow
+opencv-python
+plyfile
+huggingface_hub
+safetensors

@@ -1,0 +1,234 @@
+{
+  "id": "pi3",
+  "kind": "model",
+  "type": "model",
+  "name": "Pi3 Point Cloud",
+  "displayName": "Pi3 Point Cloud",
+  "version": "0.1.0",
+  "description": "Modly model extension for Pi3 single-image point-cloud generation. The node returns a Generate-viewer-compatible .glb point-cloud preview and preserves a raw .ply sidecar.",
+  "source": "https://github.com/yyfz/Pi3",
+  "author": "DrHepa",
+  "license": {
+    "wrapper": "MIT",
+    "upstream_code": "BSD-3-Clause with additional Apache-2.0 and CC-BY-NC-SA-4.0 file notices",
+    "weights": "Hugging Face model card: BSD-2-Clause metadata; academic-use notice; contact authors for commercial use"
+  },
+  "generator_class": "Pi3Generator",
+  "weight_owner_id": "generate",
+  "hf_repo": "yyfz233/Pi3",
+  "download_check": "model.safetensors",
+  "hf_skip_prefixes": [
+    ".gitattributes",
+    "README.md",
+    "readme.md",
+    "config.json",
+    "assets/",
+    "docs/",
+    "examples/",
+    "images/",
+    "figures/",
+    "media/"
+  ],
+  "vram_gb": 10,
+  "recommended_vram_gb": 16,
+  "tags": [
+    "image-to-3d",
+    "point-cloud",
+    "glb",
+    "ply",
+    "monocular-geometry",
+    "non-commercial"
+  ],
+  "inputs": [
+    {
+      "id": "image",
+      "type": "image",
+      "required": true,
+      "label": "Input Image"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "mesh",
+      "type": "mesh",
+      "formats": [
+        "glb",
+        "ply"
+      ],
+      "pbr": false,
+      "label": "GLB point-cloud preview with PLY sidecar"
+    }
+  ],
+  "asset_requirements": [
+    {
+      "id": "pi3-weights",
+      "type": "hf_file",
+      "repo": "yyfz233/Pi3",
+      "path": "model.safetensors",
+      "owner_id": "generate",
+      "target": "models/pi3/generate/model.safetensors",
+      "required": true,
+      "managed_by": "modly-ui",
+      "default_download": false,
+      "storage_gb": 3.8,
+      "license": "BSD-2-Clause model-card metadata; no standalone weights license"
+    }
+  ],
+  "setup": {
+    "classification": "model-managed-setup",
+    "default_downloads": false,
+    "downloads_weights": false,
+    "argv_contract": {
+      "electron": "setup.py '{\"python_exe\":\"...\",\"ext_dir\":\"...\",\"gpu_sm\":86,\"cuda_version\":128}'",
+      "cli": "setup.py --python-exe /path/to/python --ext-dir /path/to/extension"
+    },
+    "weight_management": {
+      "managed_by": "modly-ui",
+      "expected_relative_path": "models/pi3/generate/model.safetensors",
+      "hf_repo": "yyfz233/Pi3",
+      "download_check": "model.safetensors"
+    },
+    "evidence": {
+      "status_path": ".modly/setup/setup-status.json",
+      "log_path": ".modly/setup/logs/setup.log"
+    }
+  },
+  "docs": {
+    "readme": "./README.md",
+    "third_party_notices": "./THIRD_PARTY_NOTICES.md",
+    "vendored_upstream": "./pi3_vendor/pi3",
+    "setup_status": ".modly/setup/setup-status.json"
+  },
+  "nodes": [
+    {
+      "id": "generate",
+      "type": "model.generate",
+      "name": "Pi3 Point Cloud",
+      "capability_id": "image-to-point-cloud",
+      "description": "Generate a colored point cloud from one RGB image using Pi3. The returned .glb is compatible with the Generate viewer; a raw .ply sidecar is retained alongside it.",
+      "input": "image",
+      "output": "mesh",
+      "output_formats": [
+        "glb",
+        "ply"
+      ],
+      "pbr": false,
+      "hf_repo": "yyfz233/Pi3",
+      "download_check": "model.safetensors",
+      "weight_owner_id": "generate",
+      "hf_skip_prefixes": [
+        ".gitattributes",
+        "README.md",
+        "readme.md",
+        "config.json",
+        "assets/",
+        "docs/",
+        "examples/",
+        "images/",
+        "figures/",
+        "media/"
+      ],
+      "params_schema": [
+        {
+          "id": "pixel_limit",
+          "label": "Pixel Limit",
+          "type": "int",
+          "default": 255000,
+          "min": 196,
+          "max": 1200000,
+          "tooltip": "Maximum resized image pixels before Pi3 inference. Higher preserves detail but increases VRAM and time. Dimensions are rounded to multiples of 14."
+        },
+        {
+          "id": "confidence_threshold",
+          "label": "Confidence Threshold",
+          "type": "float",
+          "default": 0.1,
+          "min": 0.0,
+          "max": 1.0,
+          "step": 0.01,
+          "tooltip": "Minimum sigmoid confidence used to keep points. Higher removes uncertain points; too high can produce an empty point cloud."
+        },
+        {
+          "id": "edge_rtol",
+          "label": "Edge Relative Tolerance",
+          "type": "float",
+          "default": 0.03,
+          "min": 0.0,
+          "max": 0.25,
+          "step": 0.005,
+          "tooltip": "Relative depth-jump tolerance for Pi3 edge filtering. Lower removes more edge points."
+        },
+        {
+          "id": "edge_filter",
+          "label": "Edge Filter",
+          "type": "select",
+          "default": "true",
+          "options": [
+            {
+              "value": "true",
+              "label": "Enabled"
+            },
+            {
+              "value": "false",
+              "label": "Disabled"
+            }
+          ],
+          "tooltip": "Apply Pi3 depth/normal edge filtering before writing the point cloud."
+        },
+        {
+          "id": "torch_dtype",
+          "label": "Torch DType",
+          "type": "select",
+          "default": "auto",
+          "options": [
+            {
+              "value": "auto",
+              "label": "Auto"
+            },
+            {
+              "value": "bfloat16",
+              "label": "bfloat16"
+            },
+            {
+              "value": "float16",
+              "label": "float16"
+            },
+            {
+              "value": "float32",
+              "label": "float32"
+            }
+          ],
+          "tooltip": "CUDA autocast dtype. Auto uses bfloat16 on Ampere+ GPUs and float16 on older CUDA GPUs. CPU uses float32."
+        },
+        {
+          "id": "device",
+          "label": "Device",
+          "type": "select",
+          "default": "auto",
+          "options": [
+            {
+              "value": "auto",
+              "label": "Auto"
+            },
+            {
+              "value": "cuda",
+              "label": "CUDA"
+            },
+            {
+              "value": "cpu",
+              "label": "CPU (slow)"
+            }
+          ],
+          "tooltip": "Auto uses CUDA when available. CPU is allowed but can be extremely slow and memory-heavy."
+        },
+        {
+          "id": "output_name",
+          "label": "Output Name",
+          "type": "string",
+          "default": "pi3_point_cloud",
+          "tooltip": "Base filename for generated outputs. The extension returns <name>.glb for preview and also writes <name>.ply as a raw sidecar. Existing .ply or .glb suffixes are accepted."
+        }
+      ]
+    }
+  ]
+}

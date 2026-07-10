@@ -1,0 +1,6 @@
+{
+  "repo": "https://github.com/yyfz/Pi3",
+  "commit": "9fa3ddb3f8d53041f8b2738df404f62223bbaa7b",
+  "vendored_path": "pi3_vendor/pi3",
+  "notes": "Vendored from a shallow clone; examples and demo assets are intentionally excluded from the runtime wrapper."
+}
