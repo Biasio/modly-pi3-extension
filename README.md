@@ -18,24 +18,52 @@ Both nodes return a GLB artifact containing glTF `POINTS` for the Modly viewer a
 
 Both Pi3 and Pi3X model weights are licensed CC-BY-NC-4.0 and are strictly noncommercial. Older Pi3 Hugging Face metadata may still report BSD-2; this extension follows the current upstream repository's explicit model-weight terms. The extension does not mix or redistribute the repositories or checkpoints.
 
-## Pi3X multi-view routing
+## Pi3X named image ports
 
-The primary Modly `image` input is always the **front** view. Optional Workflow picker parameters use the established port names `left_image_path`, `back_image_path`, and `right_image_path`. Paths must resolve to regular PNG, JPEG, or WebP files inside `WORKSPACE_DIR`; traversal and symlink escapes are rejected.
+Pi3X keeps the legacy node-level `"input": "image"` selector required by Modly's image-generation API, while the workflow node exposes four named image ports:
 
-Available views are processed deterministically as front, left, back, right. Any optional view may be omitted, and a front-only Pi3X run is valid. v0.2.0 does not accept external depth, camera intrinsics, poses, masks, conditioning tensors, or semantic masks.
+- `front`: **Front RGB Image**, required.
+- `left`: **Left RGB Image**, optional.
+- `back`: **Back RGB Image**, optional.
+- `right`: **Right RGB Image**, optional.
 
-## Output bundles
+Use RGB views of the same subject. Supplied views are normalized to RGB PNG and processed deterministically as front, left, back, right; any side may be omitted, so a front-only run is valid. Modly currently transports optional side ports internally as `left_image_path`, `back_image_path`, and `right_image_path`. These are not user parameters. Until Modly core stages external side files, each side source must resolve to a regular PNG, JPEG, or WebP file inside the configured `WORKSPACE_DIR`; traversal and symlink escapes are rejected.
 
-Pi3 keeps its existing `<base>.glb` preview and `<base>.ply` sidecar behavior.
+Predicted depth, camera poses, rays, intrinsics, confidence, and NPZ data are outputs only. They are never exposed as Pi3X inputs.
 
-Pi3X uses one collision-safe base for the complete bundle:
+## Per-run output directories
 
-- `<base>.glb`: returned point-cloud preview.
-- `<base>.ply`: raw retained point cloud.
-- `<base>_pi3x.npz`: float/native arrays for points, local points, rays, metric depth, confidence logits and sigmoid confidence, valid mask, camera poses, recovered intrinsics, colors, and ordered view names.
-- `<base>_metadata.json`: model/node identity, shapes, poses, intrinsics, approximate metric scale, filtering settings, retained count, filenames, and depth-preview normalization bounds.
-- `<base>_depth_<view>.png`: 16-bit per-view depth preview normalized over finite valid values using percentiles 2–98. Metric float32 depth remains in NPZ.
-- `<base>_confidence_<view>.png`: per-view sigmoid confidence mapped linearly to 8-bit.
+Modly passes the collection root (normally `Workflows/`) as `outputs_dir`. The extension creates one unique run directory per generation and returns the nested GLB:
+
+```text
+Workflows/
+|-- pi3_<id>/
+|   |-- input/
+|   |   `-- front.png
+|   |-- <name>.glb
+|   `-- <name>.ply
+`-- pi3x_<id>/
+    |-- input/
+    |   |-- front.png
+    |   |-- left.png       # only when supplied
+    |   |-- back.png       # only when supplied
+    |   `-- right.png      # only when supplied
+    |-- <name>.glb
+    |-- <name>.ply
+    |-- <name>_pi3x.npz
+    |-- <name>_metadata.json
+    |-- <name>_depth_<view>.png
+    `-- <name>_confidence_<view>.png
+```
+
+`output_name` controls only `<name>` inside the unique run directory; it cannot select or escape the run directory. Inputs and every generated artifact are written to a hidden staging directory first. After validation, the complete directory is published with one same-filesystem atomic rename, so concurrent calls produce distinct complete runs and failures or cancellations expose no partial run.
+
+Pi3X sidecars contain:
+
+- `<name>_pi3x.npz`: float/native arrays for points, local points, rays, metric depth, confidence logits and sigmoid confidence, valid mask, camera poses, recovered intrinsics, colors, and ordered view names.
+- `<name>_metadata.json`: model/node identity, shapes, poses, intrinsics, approximate metric scale, filtering settings, retained count, relative artifact basenames, and depth-preview normalization bounds.
+- `<name>_depth_<view>.png`: 16-bit per-view depth preview normalized over finite valid values using percentiles 2-98. Metric float32 depth remains in NPZ.
+- `<name>_confidence_<view>.png`: per-view sigmoid confidence mapped linearly to 8-bit.
 
 Sidecars are documented files, not additional Modly output ports. Pi3X's predicted metric scale is approximate and should not be treated as calibrated measurement.
 

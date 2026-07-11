@@ -135,6 +135,28 @@ def _load_manifest() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _runtime_schema_node_id(environ: Mapping[str, str] | None = None) -> str:
+    """Resolve the ready-handshake schema owner without mutating generator state."""
+    process_env = os.environ if environ is None else environ
+
+    model_id = process_env.get("MODEL_ID")
+    if isinstance(model_id, str) and model_id:
+        for node_id, config in NODE_CONFIGS.items():
+            if model_id == config.model_id:
+                return node_id
+        return NODE_ID
+
+    model_dir = process_env.get("MODEL_DIR")
+    if isinstance(model_dir, str) and model_dir:
+        path = Path(model_dir)
+        owner_dir = path.parent if path.name == DOWNLOAD_CHECK else path
+        node_id = owner_dir.name
+        if owner_dir.parent.name == EXTENSION_ID and node_id in NODE_CONFIGS:
+            return node_id
+
+    return NODE_ID
+
+
 def _schema_for_node(node_id: str = NODE_ID) -> list[dict[str, Any]]:
     nodes = _load_manifest().get("nodes")
     if not isinstance(nodes, list):
@@ -305,45 +327,75 @@ def _sanitize_output_base(value: Any) -> str:
 
 
 @dataclass(frozen=True)
-class _OutputReservation:
-    base_name: str
-    marker_path: Path
-    token: str
-
-    def release(self) -> None:
-        try:
-            if self.marker_path.read_text(encoding="ascii") == self.token:
-                self.marker_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+class _RunDirectory:
+    staging_dir: Path
+    final_dir: Path
 
 
-def _reserve_output_base(
-    outputs_dir: Path,
-    base_name: str,
-    names_for_base: Callable[[str], list[str]],
-) -> _OutputReservation:
-    """Atomically reserve a collision-free output base in outputs_dir."""
+def _create_run_directory(outputs_dir: Path, prefix: str) -> _RunDirectory:
+    """Exclusively create a hidden run directory beneath the collection root."""
     outputs_dir.mkdir(parents=True, exist_ok=True)
-    candidate = base_name
     while True:
-        token = uuid.uuid4().hex
-        marker = outputs_dir / f".{candidate}.pi3-reservation"
+        run_id = uuid.uuid4().hex[:12]
+        final_dir = outputs_dir / f"{prefix}_{run_id}"
+        staging_dir = outputs_dir / f".{prefix}_{run_id}.{uuid.uuid4().hex}.tmp"
+        if final_dir.exists():
+            continue
         try:
-            fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            staging_dir.mkdir(mode=0o700)
         except FileExistsError:
-            candidate = f"{base_name}_{uuid.uuid4().hex[:8]}"
             continue
+        if final_dir.exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            continue
+        return _RunDirectory(staging_dir=staging_dir, final_dir=final_dir)
+
+
+@contextlib.contextmanager
+def _staged_run(outputs_dir: Path, prefix: str):
+    run = _create_run_directory(outputs_dir, prefix)
+    try:
+        yield run
+    finally:
+        shutil.rmtree(run.staging_dir, ignore_errors=True)
+
+
+def _validate_staged_files(staging_dir: Path, relative_names: list[str]) -> None:
+    try:
+        root = staging_dir.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("Pi3 staging directory disappeared before publication.") from exc
+
+    for relative_name in relative_names:
+        relative = Path(relative_name)
+        if relative.is_absolute():
+            raise RuntimeError(f"Pi3 staged artifact path must be relative: {relative_name}.")
+        candidate = staging_dir / relative
         try:
-            os.write(fd, token.encode("ascii"))
-        finally:
-            os.close(fd)
-        reservation = _OutputReservation(candidate, marker, token)
-        if any((outputs_dir / name).exists() for name in names_for_base(candidate)):
-            reservation.release()
-            candidate = f"{base_name}_{uuid.uuid4().hex[:8]}"
-            continue
-        return reservation
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(root)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"Pi3 staged artifact escaped or is missing: {relative_name}.") from exc
+        if not resolved.is_file() or resolved.stat().st_size <= 0:
+            raise RuntimeError(f"Pi3 staged artifact is not a non-empty regular file: {relative_name}.")
+
+
+def _publish_run_directory(
+    run: _RunDirectory,
+    expected_files: list[str],
+    returned_file: str,
+    cancel_evt: Any | None = None,
+) -> Path:
+    """Validate and atomically publish one complete same-filesystem run bundle."""
+    if returned_file not in expected_files:
+        raise RuntimeError(f"Pi3 returned artifact is not part of the staged bundle: {returned_file}.")
+    _validate_staged_files(run.staging_dir, expected_files)
+    _raise_if_cancelled(cancel_evt)
+    if run.final_dir.exists():
+        raise FileExistsError(f"Pi3 run destination already exists: {run.final_dir}.")
+    final_result = run.final_dir / returned_file
+    os.replace(run.staging_dir, run.final_dir)
+    return final_result
 
 
 def _pi3x_bundle_names(base_name: str, view_names: list[str]) -> list[str]:
@@ -425,14 +477,24 @@ def _resolve_side_image_path(value: Any, workspace_dir: Path, port_name: str) ->
     return resolved
 
 
+def _save_rgb_png(source: io.BytesIO | Path, destination: Path, label: str) -> None:
+    from PIL import Image
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with Image.open(source) as image:
+            image.load()
+            image.convert("RGB").save(destination)
+    except Exception as exc:
+        raise ValueError(f"{label} could not be decoded as a supported RGB image.") from exc
+
+
 def _prepare_pi3x_views(
     image_bytes: bytes,
     params: Mapping[str, Any],
     input_dir: Path,
     cancel_evt: Any | None = None,
 ) -> list[str]:
-    from PIL import Image
-
     view_sources: list[tuple[str, io.BytesIO | Path]] = [("front", io.BytesIO(image_bytes))]
     side_values = [(view_name, port_name, params.get(port_name)) for view_name, port_name in SIDE_VIEW_PARAMS]
     present_sides = [(view_name, port_name, value) for view_name, port_name, value in side_values if str(value or "").strip()]
@@ -445,18 +507,40 @@ def _prepare_pi3x_views(
             _raise_if_cancelled(cancel_evt)
             view_sources.append((view_name, _resolve_side_image_path(value, workspace_dir, port_name)))
 
-    input_dir.mkdir(parents=True, exist_ok=True)
     view_names: list[str] = []
-    for canonical_index, (view_name, source) in enumerate(view_sources):
+    for view_name, source in view_sources:
         _raise_if_cancelled(cancel_evt)
-        try:
-            with Image.open(source) as image:
-                image.load()
-                image.convert("RGB").save(input_dir / f"{canonical_index:02d}_{view_name}.png")
-        except Exception as exc:
-            raise ValueError(f"pi3/pi3x could not decode the {view_name} image as a supported image file.") from exc
+        _save_rgb_png(source, input_dir / f"{view_name}.png", f"pi3/pi3x {view_name} input")
         view_names.append(view_name)
     return view_names
+
+
+def _load_prepared_views(
+    load_images_as_tensor: Callable[..., Any],
+    input_dir: Path,
+    view_names: list[str],
+    pixel_limit: int,
+    cancel_evt: Any | None = None,
+) -> Any:
+    """Load canonical input filenames through an ephemeral ordered directory."""
+    ordered_dir = input_dir.parent / f".ordered-input.{uuid.uuid4().hex}.tmp"
+    ordered_dir.mkdir(mode=0o700)
+    try:
+        for index, view_name in enumerate(view_names):
+            _raise_if_cancelled(cancel_evt)
+            shutil.copyfile(
+                input_dir / f"{view_name}.png",
+                ordered_dir / f"{index:02d}_{view_name}.png",
+            )
+        with contextlib.redirect_stdout(sys.stderr):
+            return load_images_as_tensor(
+                str(ordered_dir),
+                interval=1,
+                PIXEL_LIMIT=pixel_limit,
+                verbose=False,
+            )
+    finally:
+        shutil.rmtree(ordered_dir, ignore_errors=True)
 
 
 def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -639,7 +723,7 @@ class Pi3Generator(BaseGenerator):
 
     @classmethod
     def params_schema(cls) -> list[dict[str, Any]]:
-        return _schema_for_node(NODE_ID)
+        return _schema_for_node(_runtime_schema_node_id())
 
     @classmethod
     def capability_params_schema(cls, node_id: str) -> list[dict[str, Any]]:
@@ -943,35 +1027,29 @@ class Pi3Generator(BaseGenerator):
         _log("pi3/generate: starting generation.")
         _progress(progress_cb, 2, "Preparing Pi3 input")
         _raise_if_cancelled(cancel_evt)
-        self.outputs_dir.mkdir(parents=True, exist_ok=True)
-        run_dir = self.outputs_dir / f"pi3_{uuid.uuid4().hex[:12]}"
-        try:
-            return self._generate_pi3_in_run_dir(run_dir, image_bytes, params, progress_cb, cancel_evt)
-        finally:
-            shutil.rmtree(run_dir, ignore_errors=True)
+        with _staged_run(self.outputs_dir, "pi3") as run:
+            return self._generate_pi3_in_run_dir(run, image_bytes, params, progress_cb, cancel_evt)
 
     def _generate_pi3_in_run_dir(
         self,
-        run_dir: Path,
+        run: _RunDirectory,
         image_bytes: bytes,
         params: Mapping[str, Any],
         progress_cb: Callable[..., Any] | None,
         cancel_evt: Any | None,
     ) -> Path:
         defaults = _schema_defaults("generate")
+        run_dir = run.staging_dir
         input_dir = run_dir / "input"
-        input_dir.mkdir(parents=True, exist_ok=True)
-        input_path = input_dir / "input.png"
+        input_path = input_dir / "front.png"
 
         missing = _missing_dependencies()
         if missing:
             raise RuntimeError("pi3/generate runtime dependencies are missing: " + ", ".join(missing) + ". Run extension setup first.")
 
-        from PIL import Image
         import torch
 
-        with Image.open(io.BytesIO(image_bytes)) as image:
-            image.convert("RGB").save(input_path)
+        _save_rgb_png(io.BytesIO(image_bytes), input_path, "pi3/generate front input")
 
         _progress(progress_cb, 10, "Loading Pi3 model")
         _raise_if_cancelled(cancel_evt)
@@ -998,8 +1076,13 @@ class Pi3Generator(BaseGenerator):
         device = next(self._model.parameters()).device
         _progress(progress_cb, 30, "Preprocessing image")
         _raise_if_cancelled(cancel_evt)
-        with contextlib.redirect_stdout(sys.stderr):
-            imgs = load_images_as_tensor(str(input_dir), interval=1, PIXEL_LIMIT=pixel_limit, verbose=False)
+        imgs = _load_prepared_views(
+            load_images_as_tensor,
+            input_dir,
+            ["front"],
+            pixel_limit,
+            cancel_evt,
+        )
         if not getattr(imgs, "numel", lambda: 0)():
             raise RuntimeError("pi3/generate could not load the input image into a tensor.")
         imgs = imgs.to(device)
@@ -1042,49 +1125,31 @@ class Pi3Generator(BaseGenerator):
 
         points_cpu = points.detach().cpu()
         colors_cpu = colors.detach().cpu()
-        try:
-            _validate_finite_array("points", points_cpu)
-            _validate_finite_array("colors", colors_cpu)
-        except Exception:
-            shutil.rmtree(run_dir, ignore_errors=True)
-            raise
-        reservation = _reserve_output_base(
-            self.outputs_dir,
-            output_base,
-            lambda base: [f"{base}.glb", f"{base}.ply"],
-        )
-        glb_output_path = self.outputs_dir / f"{reservation.base_name}.glb"
-        ply_output_path = self.outputs_dir / f"{reservation.base_name}.ply"
-        stage_glb = run_dir / f".{reservation.base_name}.{reservation.token}.glb.tmp"
-        stage_ply = run_dir / f".{reservation.base_name}.{reservation.token}.ply.tmp"
-        promoted: list[Path] = []
-        try:
-            _progress(progress_cb, 90, "Writing PLY point-cloud sidecar")
-            _raise_if_cancelled(cancel_evt)
-            _log(f"Writing raw PLY point-cloud sidecar to {ply_output_path}.")
-            with contextlib.redirect_stdout(sys.stderr):
-                write_ply(points_cpu, colors_cpu, str(stage_ply))
+        _validate_finite_array("points", points_cpu)
+        _validate_finite_array("colors", colors_cpu)
 
-            _progress(progress_cb, 96, "Writing GLB point-cloud preview")
-            _raise_if_cancelled(cancel_evt)
-            _log(f"Writing GLB point-cloud preview to {glb_output_path}.")
-            _write_point_cloud_glb(points_cpu, colors_cpu, stage_glb)
-            for staged, destination in ((stage_ply, ply_output_path), (stage_glb, glb_output_path)):
-                os.replace(staged, destination)
-                promoted.append(destination)
-        except Exception:
-            for path in promoted:
-                path.unlink(missing_ok=True)
-            raise
-        finally:
-            stage_glb.unlink(missing_ok=True)
-            stage_ply.unlink(missing_ok=True)
-            reservation.release()
-            shutil.rmtree(run_dir, ignore_errors=True)
+        glb_name = f"{output_base}.glb"
+        ply_name = f"{output_base}.ply"
+        glb_path = run_dir / glb_name
+        ply_path = run_dir / ply_name
+        _progress(progress_cb, 90, "Writing PLY point-cloud sidecar")
+        _raise_if_cancelled(cancel_evt)
+        _log(f"Writing raw PLY point-cloud sidecar to staged run {run.final_dir.name}/{ply_name}.")
+        with contextlib.redirect_stdout(sys.stderr):
+            write_ply(points_cpu, colors_cpu, str(ply_path))
 
-        _progress(progress_cb, 100, "Pi3 point cloud complete")
-        _log(f"pi3/generate: complete. Returning {glb_output_path}; PLY sidecar retained at {ply_output_path}.")
-        return glb_output_path
+        _progress(progress_cb, 96, "Writing GLB point-cloud preview")
+        _raise_if_cancelled(cancel_evt)
+        _log(f"Writing GLB point-cloud preview to staged run {run.final_dir.name}/{glb_name}.")
+        _write_point_cloud_glb(points_cpu, colors_cpu, glb_path)
+
+        expected_files = ["input/front.png", glb_name, ply_name]
+        _progress(progress_cb, 98, "Publishing complete Pi3 run")
+        _raise_if_cancelled(cancel_evt)
+        _log(f"pi3/generate: publishing complete run {run.final_dir}.")
+        result_path = _publish_run_directory(run, expected_files, glb_name, cancel_evt)
+        _progress(progress_cb, 100, "Pi3 run published")
+        return result_path
 
     def _generate_pi3x(
         self,
@@ -1099,18 +1164,15 @@ class Pi3Generator(BaseGenerator):
         if not image_bytes:
             raise ValueError("pi3/pi3x requires non-empty front image bytes.")
 
-        self.outputs_dir.mkdir(parents=True, exist_ok=True)
-        run_dir = self.outputs_dir / f"pi3x_{uuid.uuid4().hex[:12]}"
-        input_dir = run_dir / "input"
-        stage_dir = run_dir / "bundle"
-        promoted: list[Path] = []
-        reservation: _OutputReservation | None = None
-        try:
+        with _staged_run(self.outputs_dir, "pi3x") as run:
+            run_dir = run.staging_dir
+            input_dir = run_dir / "input"
+            stage_dir = run_dir
             _log("pi3/pi3x: starting multi-view generation.")
             _progress(progress_cb, 2, "Preparing pi3/pi3x views")
             _raise_if_cancelled(cancel_evt)
             view_names = _prepare_pi3x_views(image_bytes, params, input_dir, cancel_evt)
-            selected_ports = ["image"] + [port for view, port in SIDE_VIEW_PARAMS if view in view_names]
+            selected_ports = list(view_names)
             _log(f"pi3/pi3x: selected views {view_names}; workflow ports {selected_ports}.")
 
             missing = _missing_dependencies()
@@ -1149,8 +1211,13 @@ class Pi3Generator(BaseGenerator):
             device = next(self._model.parameters()).device
             _progress(progress_cb, 32, "Preprocessing pi3/pi3x views")
             _raise_if_cancelled(cancel_evt)
-            with contextlib.redirect_stdout(sys.stderr):
-                imgs = load_images_as_tensor(str(input_dir), interval=1, PIXEL_LIMIT=pixel_limit, verbose=False)
+            imgs = _load_prepared_views(
+                load_images_as_tensor,
+                input_dir,
+                view_names,
+                pixel_limit,
+                cancel_evt,
+            )
             if not getattr(imgs, "numel", lambda: 0)():
                 raise RuntimeError("pi3/pi3x could not load the selected views into a tensor.")
             if int(imgs.shape[0]) != len(view_names):
@@ -1218,13 +1285,7 @@ class Pi3Generator(BaseGenerator):
                 "colors": np.asarray(_tensor_to_numpy(colors_tensor), dtype=np.float32),
             }
             _validate_pi3x_arrays(arrays)
-            reservation = _reserve_output_base(
-                self.outputs_dir,
-                output_base,
-                lambda base: _pi3x_bundle_names(base, view_names),
-            )
-            bundle_base = reservation.base_name
-            stage_dir.mkdir(parents=True, exist_ok=True)
+            bundle_base = output_base
             stage_glb = stage_dir / f"{bundle_base}.glb"
             stage_ply = stage_dir / f"{bundle_base}.ply"
             points_cpu = points.detach().cpu()
@@ -1275,28 +1336,15 @@ class Pi3Generator(BaseGenerator):
                 progress_cb=progress_cb,
             )
 
-            _progress(progress_cb, 98, "Publishing pi3/pi3x bundle")
-            _raise_if_cancelled(cancel_evt)
             expected_names = _pi3x_bundle_names(bundle_base, view_names)
-            missing_staged = [name for name in expected_names if not (stage_dir / name).is_file()]
-            if missing_staged:
-                raise RuntimeError("pi3/pi3x export bundle is incomplete: " + ", ".join(missing_staged))
-            for name in expected_names:
-                _raise_if_cancelled(cancel_evt)
-                destination = self.outputs_dir / name
-                os.replace(stage_dir / name, destination)
-                promoted.append(destination)
-
-            final_glb = self.outputs_dir / f"{bundle_base}.glb"
-            _progress(progress_cb, 100, "pi3/pi3x point cloud complete")
-            _log(f"pi3/pi3x: generation complete; returning {final_glb} with {len(promoted) - 1} sidecars.")
-            shutil.rmtree(run_dir, ignore_errors=True)
-            return final_glb
-        except Exception:
-            for path in promoted:
-                path.unlink(missing_ok=True)
-            shutil.rmtree(run_dir, ignore_errors=True)
-            raise
-        finally:
-            if reservation is not None:
-                reservation.release()
+            expected_files = [f"input/{name}.png" for name in view_names] + expected_names
+            glb_name = f"{bundle_base}.glb"
+            _progress(progress_cb, 98, "Publishing complete pi3/pi3x run")
+            _raise_if_cancelled(cancel_evt)
+            _log(
+                f"pi3/pi3x: publishing complete run {run.final_dir} "
+                f"with {len(expected_names) - 1} sidecars."
+            )
+            result_path = _publish_run_directory(run, expected_files, glb_name, cancel_evt)
+            _progress(progress_cb, 100, "pi3/pi3x run published")
+            return result_path

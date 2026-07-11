@@ -4,7 +4,7 @@
   "type": "model",
   "name": "Pi3 Point Cloud",
   "displayName": "Pi3 Point Cloud",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Modly model extension with independent Pi3 single-image and Pi3X one-to-four-view point-cloud generation nodes.",
   "source": "https://github.com/yyfz/Pi3",
   "author": "DrHepa",
@@ -268,6 +268,32 @@
       "capability_id": "image-to-point-cloud",
       "description": "Generate a colored point cloud from one to four ordered RGB views using image-only Pi3X.",
       "input": "image",
+      "inputs": [
+        {
+          "name": "front",
+          "label": "Front RGB Image",
+          "type": "image",
+          "required": true
+        },
+        {
+          "name": "left",
+          "label": "Left RGB Image",
+          "type": "image",
+          "required": false
+        },
+        {
+          "name": "back",
+          "label": "Back RGB Image",
+          "type": "image",
+          "required": false
+        },
+        {
+          "name": "right",
+          "label": "Right RGB Image",
+          "type": "image",
+          "required": false
+        }
+      ],
       "output": "mesh",
       "output_formats": [
         "glb",
@@ -339,63 +365,6 @@
             }
           ],
           "tooltip": "Apply Pi3 depth/normal edge filtering before writing the point cloud."
-        },
-        {
-          "id": "left_image_path",
-          "label": "Left View Image",
-          "type": "string",
-          "default": "",
-          "pickerIntent": "image",
-          "filters": [
-            {
-              "name": "Images",
-              "extensions": [
-                "png",
-                "jpg",
-                "jpeg",
-                "webp"
-              ]
-            }
-          ],
-          "tooltip": "Optional left-side view image path inside WORKSPACE_DIR."
-        },
-        {
-          "id": "back_image_path",
-          "label": "Back View Image",
-          "type": "string",
-          "default": "",
-          "pickerIntent": "image",
-          "filters": [
-            {
-              "name": "Images",
-              "extensions": [
-                "png",
-                "jpg",
-                "jpeg",
-                "webp"
-              ]
-            }
-          ],
-          "tooltip": "Optional back view image path inside WORKSPACE_DIR."
-        },
-        {
-          "id": "right_image_path",
-          "label": "Right View Image",
-          "type": "string",
-          "default": "",
-          "pickerIntent": "image",
-          "filters": [
-            {
-              "name": "Images",
-              "extensions": [
-                "png",
-                "jpg",
-                "jpeg",
-                "webp"
-              ]
-            }
-          ],
-          "tooltip": "Optional right-side view image path inside WORKSPACE_DIR."
         },
         {
           "id": "torch_dtype",

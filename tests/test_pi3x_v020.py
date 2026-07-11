@@ -21,22 +21,124 @@ except ImportError:  # pragma: no cover
 ROOT = Path(__file__).resolve().parents[1]
 
 
+class Pi3RuntimeParamsSchemaTests(unittest.TestCase):
+    @staticmethod
+    def _schema_by_id():
+        return {item["id"]: item for item in generator.Pi3Generator.params_schema()}
+
+    def test_pi3x_model_id_selects_pi3x_runtime_schema(self):
+        with mock.patch.dict(
+            os.environ,
+            {"MODEL_ID": "pi3/pi3x", "MODEL_DIR": "/models/pi3/generate"},
+            clear=True,
+        ):
+            schema = self._schema_by_id()
+
+        self.assertTrue(
+            {"left_image_path", "back_image_path", "right_image_path"}.isdisjoint(schema)
+        )
+        self.assertEqual(schema["output_name"]["default"], "pi3x_point_cloud")
+
+    def test_generate_model_id_selects_pi3_runtime_schema(self):
+        with mock.patch.dict(
+            os.environ,
+            {"MODEL_ID": "pi3/generate", "MODEL_DIR": "/models/pi3/pi3x"},
+            clear=True,
+        ):
+            schema = self._schema_by_id()
+
+        self.assertTrue(
+            {"left_image_path", "back_image_path", "right_image_path"}.isdisjoint(schema)
+        )
+        self.assertEqual(schema["output_name"]["default"], "pi3_point_cloud")
+
+    def test_invalid_model_id_suppresses_pi3x_model_dir(self):
+        for model_id in ("pi3", "foreign/pi3x", "pi3/unknown", "pi3/pi3x/extra"):
+            with self.subTest(model_id=model_id), mock.patch.dict(
+                os.environ,
+                {"MODEL_ID": model_id, "MODEL_DIR": "/models/pi3/pi3x"},
+                clear=True,
+            ):
+                schema = self._schema_by_id()
+                self.assertNotIn("left_image_path", schema)
+                self.assertEqual(schema["output_name"]["default"], "pi3_point_cloud")
+
+    def test_model_dir_fallback_accepts_only_known_pi3_owners(self):
+        self.assertEqual(
+            generator._runtime_schema_node_id({"MODEL_DIR": "/models/pi3/pi3x"}),
+            "pi3x",
+        )
+        self.assertEqual(
+            generator._runtime_schema_node_id(
+                {"MODEL_DIR": "/models/pi3/pi3x/model.safetensors"}
+            ),
+            "pi3x",
+        )
+        self.assertEqual(
+            generator._runtime_schema_node_id(
+                {"MODEL_ID": "", "MODEL_DIR": "/models/pi3/pi3x"}
+            ),
+            "pi3x",
+        )
+        self.assertEqual(
+            generator._runtime_schema_node_id({"MODEL_DIR": "/models/foreign/pi3x"}),
+            "generate",
+        )
+        self.assertEqual(
+            generator._runtime_schema_node_id({"MODEL_DIR": "/models/pi3/unknown"}),
+            "generate",
+        )
+
+    def test_runtime_schema_environment_is_restored(self):
+        before = {name: os.environ.get(name) for name in ("MODEL_ID", "MODEL_DIR")}
+
+        with mock.patch.dict(
+            os.environ,
+            {"MODEL_ID": "pi3/pi3x", "MODEL_DIR": "/models/pi3/pi3x"},
+            clear=False,
+        ):
+            self.assertEqual(
+                self._schema_by_id()["output_name"]["default"],
+                "pi3x_point_cloud",
+            )
+
+        self.assertEqual(
+            {name: os.environ.get(name) for name in ("MODEL_ID", "MODEL_DIR")},
+            before,
+        )
+
+
 @unittest.skipIf(np is None or Image is None, "NumPy and Pillow are required for sidecar tests")
-class Pi3ExtensionV020Tests(unittest.TestCase):
+class Pi3ExtensionV021Tests(unittest.TestCase):
     def _image_bytes(self, color=(20, 40, 60)):
         stream = io.BytesIO()
         Image.new("RGB", (8, 6), color).save(stream, format="PNG")
         return stream.getvalue()
 
+    @staticmethod
+    def _write_file(path, payload):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+
     def test_manifest_separates_canonical_pi3_and_pi3x(self):
         manifest = json.loads((ROOT / "manifest.json").read_text())
-        self.assertEqual(manifest["version"], "0.2.0")
+        self.assertEqual(manifest["version"], "0.2.1")
         nodes = {node["id"]: node for node in manifest["nodes"]}
         self.assertEqual(set(nodes), {"generate", "pi3x"})
         self.assertEqual(nodes["generate"]["weight_owner_id"], "generate")
         self.assertEqual(nodes["generate"]["hf_repo"], "yyfz233/Pi3")
         self.assertEqual(nodes["pi3x"]["weight_owner_id"], "pi3x")
         self.assertEqual(nodes["pi3x"]["hf_repo"], "yyfz233/Pi3X")
+        self.assertEqual(nodes["pi3x"]["input"], "image")
+        self.assertEqual(
+            nodes["pi3x"]["inputs"],
+            [
+                {"name": "front", "label": "Front RGB Image", "type": "image", "required": True},
+                {"name": "left", "label": "Left RGB Image", "type": "image", "required": False},
+                {"name": "back", "label": "Back RGB Image", "type": "image", "required": False},
+                {"name": "right", "label": "Right RGB Image", "type": "image", "required": False},
+            ],
+        )
         assets = {asset["id"]: asset for asset in manifest["asset_requirements"]}
         self.assertEqual(assets["pi3-weights"]["target"], "models/pi3/generate/model.safetensors")
         self.assertEqual(assets["pi3x-weights"]["target"], "models/pi3/pi3x/model.safetensors")
@@ -56,6 +158,9 @@ class Pi3ExtensionV020Tests(unittest.TestCase):
         self.assertEqual(generate["edge_filter"]["default"], "true")
         self.assertEqual(generate["edge_rtol"]["default"], 0.03)
         self.assertEqual(pi3x["output_name"]["default"], "pi3x_point_cloud")
+        self.assertTrue(
+            {"left_image_path", "back_image_path", "right_image_path"}.isdisjoint(pi3x)
+        )
         for name in ("pixel_limit", "confidence_threshold", "edge_filter", "edge_rtol"):
             for field in ("type", "default", "min", "max", "step", "options"):
                 if field in generate[name]:
@@ -218,8 +323,25 @@ class Pi3ExtensionV020Tests(unittest.TestCase):
                 self.assertEqual(names, ["front", "left", "back", "right"])
                 self.assertEqual(
                     [path.name for path in sorted(input_dir.iterdir())],
+                    ["back.png", "front.png", "left.png", "right.png"],
+                )
+                loaded_names = []
+
+                def fake_loader(path, **_kwargs):
+                    loaded_names.extend(item.name for item in sorted(Path(path).iterdir()))
+                    return object()
+
+                generator._load_prepared_views(
+                    fake_loader,
+                    input_dir,
+                    names,
+                    pixel_limit=255000,
+                )
+                self.assertEqual(
+                    loaded_names,
                     ["00_front.png", "01_left.png", "02_back.png", "03_right.png"],
                 )
+                self.assertFalse(list(root.glob(".ordered-input.*.tmp")))
                 with self.assertRaisesRegex(ValueError, "inside WORKSPACE_DIR"):
                     generator._resolve_side_image_path("../escape.png", workspace, "left_image_path")
                 bad = workspace / "bad.txt"
@@ -247,52 +369,176 @@ class Pi3ExtensionV020Tests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unexpected non-multimodal"):
             generator._validate_pi3x_state_keys([], ["decoder.bad.weight"])
 
-    def test_atomic_reservation_checks_existing_sidecars(self):
+    def test_pi3_success_publishes_one_nested_complete_run(self):
         with tempfile.TemporaryDirectory() as temp:
-            outputs = Path(temp)
-            (outputs / "cloud_metadata.json").write_text("{}")
-            reservation = generator._reserve_output_base(
-                outputs,
-                "cloud",
-                lambda base: generator._pi3x_bundle_names(base, ["front"]),
-            )
-            try:
-                self.assertNotEqual(reservation.base_name, "cloud")
-            finally:
-                reservation.release()
+            outputs = Path(temp) / "Workflows"
+            run = generator._create_run_directory(outputs, "pi3")
+            base = generator._sanitize_output_base("../../outside/cloud.glb")
+            self.assertEqual(base, "cloud")
+            self._write_file(run.staging_dir / "input" / "front.png", self._image_bytes())
+            self._write_file(run.staging_dir / f"{base}.glb", b"glb")
+            self._write_file(run.staging_dir / f"{base}.ply", b"ply")
 
-    def test_atomic_reservation_gives_concurrent_callers_distinct_bases(self):
+            result = generator._publish_run_directory(
+                run,
+                ["input/front.png", f"{base}.glb", f"{base}.ply"],
+                f"{base}.glb",
+            )
+
+            self.assertRegex(result.parent.name, r"^pi3_[0-9a-f]{12}$")
+            self.assertEqual(result, result.parent / "cloud.glb")
+            self.assertEqual(
+                {path.relative_to(result.parent).as_posix() for path in result.parent.rglob("*") if path.is_file()},
+                {"input/front.png", "cloud.glb", "cloud.ply"},
+            )
+            self.assertEqual(list(outputs.iterdir()), [result.parent])
+            self.assertFalse(list(outputs.glob("*.glb")))
+            self.assertFalse(list(outputs.glob(".*")))
+            self.assertFalse((Path(temp) / "outside" / "cloud.glb").exists())
+
+    def test_pi3x_success_publishes_inputs_and_every_sidecar_together(self):
         with tempfile.TemporaryDirectory() as temp:
-            outputs = Path(temp)
+            outputs = Path(temp) / "Workflows"
+            run = generator._create_run_directory(outputs, "pi3x")
+            view_names = ["front", "left", "back", "right"]
+            base = "bundle"
+            for view_name in view_names:
+                self._write_file(
+                    run.staging_dir / "input" / f"{view_name}.png",
+                    self._image_bytes(),
+                )
+            self._write_file(run.staging_dir / f"{base}.glb", b"glb")
+            self._write_file(run.staging_dir / f"{base}.ply", b"ply")
+            filenames = {
+                "glb": f"{base}.glb",
+                "ply": f"{base}.ply",
+                "npz": f"{base}_pi3x.npz",
+                "metadata": f"{base}_metadata.json",
+                "depth_previews": [f"{base}_depth_{name}.png" for name in view_names],
+                "confidence_previews": [f"{base}_confidence_{name}.png" for name in view_names],
+            }
+            generator._write_pi3x_sidecars(
+                run.staging_dir,
+                base,
+                arrays=self._valid_sidecar_arrays(n=4),
+                metadata={"filenames": filenames},
+                view_names=view_names,
+            )
+            bundle_names = generator._pi3x_bundle_names(base, view_names)
+            expected = [f"input/{name}.png" for name in view_names] + bundle_names
+
+            result = generator._publish_run_directory(
+                run,
+                expected,
+                f"{base}.glb",
+            )
+
+            self.assertRegex(result.parent.name, r"^pi3x_[0-9a-f]{12}$")
+            self.assertEqual(result, result.parent / "bundle.glb")
+            self.assertEqual(
+                {path.relative_to(result.parent).as_posix() for path in result.parent.rglob("*") if path.is_file()},
+                set(expected),
+            )
+            metadata = json.loads((result.parent / filenames["metadata"]).read_text())
+            for value in metadata["filenames"].values():
+                for name in value if isinstance(value, list) else [value]:
+                    self.assertEqual(Path(name).name, name)
+                    self.assertTrue((result.parent / name).is_file())
+            self.assertEqual(list(outputs.iterdir()), [result.parent])
+            self.assertFalse(list(outputs.glob("*.glb")))
+            self.assertFalse(list(outputs.glob(".*")))
+
+    def test_concurrent_run_publications_are_distinct_and_complete(self):
+        with tempfile.TemporaryDirectory() as temp:
+            outputs = Path(temp) / "Workflows"
             barrier = threading.Barrier(2)
-            reservations = []
+            results = []
             failures = []
 
-            def reserve():
+            def publish():
                 try:
-                    reservation = generator._reserve_output_base(
-                        outputs,
-                        "cloud",
-                        lambda base: [f"{base}.glb", f"{base}.ply"],
-                    )
-                    reservations.append(reservation)
+                    run = generator._create_run_directory(outputs, "pi3")
+                    self._write_file(run.staging_dir / "input" / "front.png", b"front")
+                    self._write_file(run.staging_dir / "cloud.glb", b"glb")
+                    self._write_file(run.staging_dir / "cloud.ply", b"ply")
                     barrier.wait(timeout=2)
+                    results.append(
+                        generator._publish_run_directory(
+                            run,
+                            ["input/front.png", "cloud.glb", "cloud.ply"],
+                            "cloud.glb",
+                        )
+                    )
                 except Exception as exc:  # pragma: no cover - diagnostic path
                     failures.append(exc)
 
-            threads = [threading.Thread(target=reserve) for _ in range(2)]
+            threads = [threading.Thread(target=publish) for _ in range(2)]
             for thread in threads:
                 thread.start()
             for thread in threads:
                 thread.join(timeout=3)
-            try:
-                self.assertFalse(failures)
-                self.assertEqual(len(reservations), 2)
-                self.assertEqual(len({item.base_name for item in reservations}), 2)
-            finally:
-                for reservation in reservations:
-                    reservation.release()
-            self.assertFalse(list(outputs.glob(".*.pi3-reservation")))
+
+            self.assertFalse(failures)
+            self.assertEqual(len(results), 2)
+            self.assertEqual(len({path.parent for path in results}), 2)
+            for result in results:
+                self.assertEqual(
+                    {path.relative_to(result.parent).as_posix() for path in result.parent.rglob("*") if path.is_file()},
+                    {"input/front.png", "cloud.glb", "cloud.ply"},
+                )
+            self.assertFalse(list(outputs.glob(".*")))
+
+    def test_incomplete_output_cleans_hidden_stage_and_publishes_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            outputs = Path(temp) / "Workflows"
+            with self.assertRaisesRegex(RuntimeError, "escaped or is missing"):
+                with generator._staged_run(outputs, "pi3") as run:
+                    self._write_file(run.staging_dir / "input" / "front.png", b"front")
+                    self._write_file(run.staging_dir / "cloud.ply", b"ply")
+                    generator._publish_run_directory(
+                        run,
+                        ["input/front.png", "cloud.glb", "cloud.ply"],
+                        "cloud.glb",
+                    )
+            self.assertEqual(list(outputs.iterdir()), [])
+
+    def test_publish_error_cleans_hidden_stage_and_publishes_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            outputs = Path(temp) / "Workflows"
+            with self.assertRaisesRegex(OSError, "synthetic publish failure"):
+                with generator._staged_run(outputs, "pi3") as run:
+                    self._write_file(run.staging_dir / "input" / "front.png", b"front")
+                    self._write_file(run.staging_dir / "cloud.glb", b"glb")
+                    self._write_file(run.staging_dir / "cloud.ply", b"ply")
+                    with mock.patch.object(
+                        generator.os,
+                        "replace",
+                        side_effect=OSError("synthetic publish failure"),
+                    ):
+                        generator._publish_run_directory(
+                            run,
+                            ["input/front.png", "cloud.glb", "cloud.ply"],
+                            "cloud.glb",
+                        )
+            self.assertEqual(list(outputs.iterdir()), [])
+
+    def test_cancellation_cleans_hidden_stage_and_publishes_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            outputs = Path(temp) / "Workflows"
+            cancel_evt = threading.Event()
+            cancel_evt.set()
+            with self.assertRaises(generator.GenerationCancelled):
+                with generator._staged_run(outputs, "pi3x") as run:
+                    self._write_file(run.staging_dir / "input" / "front.png", b"front")
+                    self._write_file(run.staging_dir / "bundle.glb", b"glb")
+                    self._write_file(run.staging_dir / "bundle.ply", b"ply")
+                    generator._publish_run_directory(
+                        run,
+                        ["input/front.png", "bundle.glb", "bundle.ply"],
+                        "bundle.glb",
+                        cancel_evt,
+                    )
+            self.assertEqual(list(outputs.iterdir()), [])
 
     def test_glb_writer_rejects_non_finite_values_without_file(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -337,8 +583,8 @@ class Pi3ExtensionV020Tests(unittest.TestCase):
                 )
             self.assertEqual(list(stage.iterdir()), [])
 
-    def _valid_sidecar_arrays(self):
-        n, h, w = 2, 4, 5
+    def _valid_sidecar_arrays(self, n=2):
+        h, w = 4, 5
         depth = np.linspace(1.0, 4.0, n * h * w, dtype=np.float32).reshape(n, h, w)
         return {
             "points": np.zeros((n, h, w, 3), np.float32),
@@ -389,7 +635,7 @@ class Pi3ExtensionV020Tests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(RuntimeError, "synthetic load failure"):
                     gen.generate(self._image_bytes(), {})
-            self.assertFalse(any(path.name.startswith("pi3x_") for path in outputs.iterdir()))
+            self.assertEqual(list(outputs.iterdir()), [])
 
     def test_failed_legacy_pi3_generation_cleans_run_directory(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -398,7 +644,7 @@ class Pi3ExtensionV020Tests(unittest.TestCase):
             with mock.patch.object(generator, "_missing_dependencies", return_value=["torch"]):
                 with self.assertRaisesRegex(RuntimeError, "runtime dependencies are missing"):
                     gen.generate(self._image_bytes(), {})
-            self.assertFalse(any(path.name.startswith("pi3_") for path in outputs.iterdir()))
+            self.assertEqual(list(outputs.iterdir()), [])
 
 
 if __name__ == "__main__":
