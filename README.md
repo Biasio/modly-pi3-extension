@@ -1,22 +1,47 @@
-# Pi3 Point Cloud for Modly
+# Pi3 and Pi3X Point Clouds for Modly
 
-Pi3 Point Cloud is a Modly model extension by **DrHepa** integrating upstream [Pi3](https://github.com/yyfz/Pi3). It turns a single RGB image into a colored point cloud.
+This extension exposes two independent model nodes through one generator class:
 
-The `pi3/generate` node returns a GLB artifact containing glTF `POINTS` for the Modly viewer and also writes a raw PLY sidecar. This is a point-cloud export, not a textured mesh: it does not provide mesh topology, PBR materials, or textured geometry. Pi3X is not supported.
+- `pi3/generate` preserves the Pi3 single-image point-cloud workflow.
+- `pi3/pi3x` runs image-only Pi3X from one to four ordered RGB views.
+
+Both nodes return a GLB artifact containing glTF `POINTS` for the Modly viewer and retain a raw PLY beside it. These are point clouds, not textured meshes: there is no mesh topology, PBR material, or textured geometry.
 
 ## Model weights
 
-`setup.py` prepares dependencies and never downloads weights. Download `yyfz233/Pi3/model.safetensors` in Modly's model-download UI. The runtime expects:
+`setup.py` prepares shared dependencies and FlashAttention, but never downloads weights. Use Modly's Models UI to download each node independently:
 
-```text
-models/pi3/generate/model.safetensors
-```
+| Node | Hugging Face repository | Runtime path | Storage |
+| --- | --- | --- | --- |
+| `pi3/generate` | `yyfz233/Pi3` | `models/pi3/generate/model.safetensors` | about 3.8 GB |
+| `pi3/pi3x` | `yyfz233/Pi3X` | `models/pi3/pi3x/model.safetensors` | about 5.44 GB |
 
-The approximate storage requirement is 3.8 GB. Use Modly's Models UI for the Hugging Face weight download after setup completes.
+Both Pi3 and Pi3X model weights are licensed CC-BY-NC-4.0 and are strictly noncommercial. Older Pi3 Hugging Face metadata may still report BSD-2; this extension follows the current upstream repository's explicit model-weight terms. The extension does not mix or redistribute the repositories or checkpoints.
+
+## Pi3X multi-view routing
+
+The primary Modly `image` input is always the **front** view. Optional Workflow picker parameters use the established port names `left_image_path`, `back_image_path`, and `right_image_path`. Paths must resolve to regular PNG, JPEG, or WebP files inside `WORKSPACE_DIR`; traversal and symlink escapes are rejected.
+
+Available views are processed deterministically as front, left, back, right. Any optional view may be omitted, and a front-only Pi3X run is valid. v0.2.0 does not accept external depth, camera intrinsics, poses, masks, conditioning tensors, or semantic masks.
+
+## Output bundles
+
+Pi3 keeps its existing `<base>.glb` preview and `<base>.ply` sidecar behavior.
+
+Pi3X uses one collision-safe base for the complete bundle:
+
+- `<base>.glb`: returned point-cloud preview.
+- `<base>.ply`: raw retained point cloud.
+- `<base>_pi3x.npz`: float/native arrays for points, local points, rays, metric depth, confidence logits and sigmoid confidence, valid mask, camera poses, recovered intrinsics, colors, and ordered view names.
+- `<base>_metadata.json`: model/node identity, shapes, poses, intrinsics, approximate metric scale, filtering settings, retained count, filenames, and depth-preview normalization bounds.
+- `<base>_depth_<view>.png`: 16-bit per-view depth preview normalized over finite valid values using percentiles 2–98. Metric float32 depth remains in NPZ.
+- `<base>_confidence_<view>.png`: per-view sigmoid confidence mapped linearly to 8-bit.
+
+Sidecars are documented files, not additional Modly output ports. Pi3X's predicted metric scale is approximate and should not be treated as calibrated measurement.
 
 ## Setup
 
-Modly/Electron calls setup like:
+Modly/Electron calls:
 
 ```bash
 python setup.py '{"python_exe":"...","ext_dir":"...","gpu_sm":86,"cuda_version":128}'
@@ -28,44 +53,20 @@ Manual equivalent:
 python setup.py --python-exe /path/to/runtime/python --ext-dir /path/to/installed/extension
 ```
 
-Setup installs `requirements.txt` into the provided Python runtime when imports are missing, prepares the CUDA PyTorch lane, probes or installs `flash-attn` when CUDA is expected, writes `.modly/setup/setup-status.json`, and reports whether weights are present. Missing weights are a readiness warning, not a setup failure.
+Setup writes `.modly/setup/setup-status.json`. For backward compatibility, its top-level `status` and `weights_present` fields describe the existing `pi3/generate` node: missing dependencies produce `needs_dependencies`, and missing Pi3 weights produce `needs_weights`. A missing Pi3X checkpoint does not downgrade a ready Pi3 setup. The `nodes.generate` and `nodes.pi3x` diagnostics report each checkpoint independently, and runtime readiness remains live and node-specific. Missing weights remain a successful setup exit because the UI owns downloads.
 
-The primary CUDA path is a local or source-built `flash-attn` package for fp16/bf16 no-mask attention. PyTorch SDPA (math/efficient backends) is the runtime fallback. On newer hardware such as GB10/sm_121, missing `flash-attn` can make the primary CUDA path unavailable.
-
-Local flash-attn wheelhouse:
-
-```text
-.pi3-runtime/wheelhouse/flash-attn/
-```
-
-Build a reusable local wheel, then rerun normal setup:
+The primary CUDA path uses local/source-built `flash-attn` for fp16/bf16 no-mask attention, with PyTorch SDPA as runtime fallback. A reusable wheel can be prepared in `.pi3-runtime/wheelhouse/flash-attn/`:
 
 ```bash
 python3 setup.py --build-flash-attn-wheel --max-build-jobs 2 '{"python_exe":"/path/to/python","ext_dir":"/path/to/Modly/extensions/pi3","gpu_sm":121,"cuda_version":128}'
-python3 setup.py '{"python_exe":"/path/to/python","ext_dir":"/path/to/Modly/extensions/pi3","gpu_sm":121,"cuda_version":128}'
 ```
 
-Normal setup checks the local wheelhouse first, then binary wheels, then allows a source build for GB10/Blackwell or when `--allow-flash-attn-source-build` / `MODLY_PI3_ALLOW_FLASH_ATTN_SOURCE_BUILD=1` is explicit. Use `--max-build-jobs` or `MODLY_PI3_MAX_BUILD_JOBS` to keep source builds bounded.
+## Parameters
 
-## Generation parameters
+Both nodes use the same validated bounds and controls for `pixel_limit`, `confidence_threshold`, `edge_filter`, `edge_rtol`, `torch_dtype`, and `device`. Pi3 defaults to `pi3_point_cloud`; Pi3X defaults to `pi3x_point_cloud`.
 
-- `pixel_limit`: Resize budget before inference.
-- `confidence_threshold`: Confidence cutoff for retained points.
-- `edge_filter` / `edge_rtol`: Optional upstream Pi3 geometry edge filtering.
-- `torch_dtype`: CUDA autocast dtype (`auto`, `bfloat16`, `float16`, `float32`).
-- `device`: `auto`, `cuda`, or `cpu`. CUDA is strongly recommended; CPU can be very slow.
-- `output_name`: Base filename for the generated `.glb` and `.ply` outputs.
+CUDA is strongly recommended. CPU execution is valid but can be extremely slow and memory-heavy.
 
-## Troubleshooting
+## Licensing
 
-- `flash-attn-wheel-unavailable`: CUDA is expected but no compatible wheel was available. Build a local wheel into `.pi3-runtime/wheelhouse/flash-attn/` with `--build-flash-attn-wheel`, then rerun setup.
-- `flash-attn-source-build-failed`: Inspect `.modly/setup/logs/setup.log`; confirm CUDA 12.8/nvcc is available for GB10/Blackwell and lower `--max-build-jobs` if the build exhausts RAM.
-- `RuntimeError: No available kernel. Aborting execution.`: Rerun setup and verify `flash_attn_status` in `.modly/setup/setup-status.json`.
-
-## Upstream, credits, and licensing
-
-- Upstream repository: [yyfz/Pi3](https://github.com/yyfz/Pi3)
-- Model repository and card: [yyfz233/Pi3 on Hugging Face](https://huggingface.co/yyfz233/Pi3)
-- Cite Pi3 using the [upstream citation guidance](https://github.com/yyfz/Pi3#citation).
-
-The original Modly integration is MIT-licensed. Vendored Pi3 code remains under its own BSD-3-Clause license and includes file-specific Apache-2.0 and CC-BY-NC-SA-4.0 notices. The weights are not redistributed; review the current upstream model-card terms before use, especially for commercial use. See [LICENSE](./LICENSE) and [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
+The extension wrapper remains MIT-licensed. Vendored Pi3 and Pi3X upstream source code remains BSD-3-Clause with existing file-level notices. The separately distributed Pi3 and Pi3X model weights are CC-BY-NC-4.0 and strictly noncommercial; older Pi3 Hugging Face metadata may still report BSD-2, but the extension follows the current upstream repository's explicit weight terms. See [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).

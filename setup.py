@@ -27,6 +27,10 @@ EXTENSION_ID = "pi3"
 NODE_ID = "generate"
 HF_REPO = "yyfz233/Pi3"
 DOWNLOAD_CHECK = "model.safetensors"
+NODE_WEIGHTS = {
+    "generate": {"hf_repo": "yyfz233/Pi3", "owner_id": "generate"},
+    "pi3x": {"hf_repo": "yyfz233/Pi3X", "owner_id": "pi3x"},
+}
 SCRIPT_DIR = Path(__file__).resolve().parent
 REQUIREMENTS_PATH = SCRIPT_DIR / "requirements.txt"
 STATUS_RELATIVE_PATH = Path(".modly") / "setup" / "setup-status.json"
@@ -144,13 +148,38 @@ def modly_home_model_dir(ext_dir: Path) -> Path | None:
     return ext_dir.parent.parent / DEFAULT_MODEL_RELATIVE_PATH
 
 
+def _resolve_explicit_node_model_dir(model_path: Path, node_id: str) -> dict[str, Any]:
+    """Resolve an explicit directory/checkpoint without crossing weight owners."""
+    owner_id = str(NODE_WEIGHTS[node_id]["owner_id"])
+    explicit_dir = model_path.parent if model_path.name == DOWNLOAD_CHECK else model_path
+    explicit_owner = (
+        explicit_dir.name
+        if explicit_dir.name in NODE_WEIGHTS and explicit_dir.parent.name == EXTENSION_ID
+        else None
+    )
+
+    if explicit_owner is not None:
+        path = explicit_dir.parent / owner_id
+        note = (
+            f"The explicit model_dir belongs to {EXTENSION_ID}/{explicit_owner}; "
+            f"checking {EXTENSION_ID}/{node_id} only in its isolated owner directory."
+        )
+    elif node_id == NODE_ID:
+        path = explicit_dir
+        note = "Using the explicit model_dir as the legacy pi3/generate override."
+    else:
+        path = explicit_dir / EXTENSION_ID / owner_id
+        note = (
+            "The explicit model_dir is not owner-qualified; preserving it for legacy "
+            f"pi3/generate and checking {EXTENSION_ID}/{node_id} beneath it."
+        )
+
+    return {"path": path, "source": "explicit_model_dir", "note": note}
+
+
 def resolve_expected_model_dir(config: SetupConfig) -> dict[str, Any]:
     if config.model_dir is not None:
-        return {
-            "path": config.model_dir,
-            "source": "explicit_model_dir",
-            "note": "Using the explicit model_dir provided to setup.",
-        }
+        return _resolve_explicit_node_model_dir(config.model_dir, NODE_ID)
 
     models_dir = os.environ.get("MODELS_DIR")
     if models_dir and models_dir.strip():
@@ -173,6 +202,64 @@ def resolve_expected_model_dir(config: SetupConfig) -> dict[str, Any]:
         "source": "extension_local_fallback",
         "note": "Using the extension-local models directory as a fallback only; installed Modly extensions normally use the sibling Modly models directory.",
     }
+
+
+def resolve_node_model_dir(config: SetupConfig, node_id: str) -> dict[str, Any]:
+    if node_id not in NODE_WEIGHTS:
+        raise ValueError(f"Unknown Pi3 setup node: {node_id}")
+    if config.model_dir is not None:
+        return _resolve_explicit_node_model_dir(config.model_dir, node_id)
+    if node_id == NODE_ID:
+        return resolve_expected_model_dir(config)
+    owner_id = str(NODE_WEIGHTS[node_id]["owner_id"])
+    models_dir = os.environ.get("MODELS_DIR")
+    if models_dir and models_dir.strip():
+        return {
+            "path": Path(models_dir).expanduser().resolve() / EXTENSION_ID / owner_id,
+            "source": "MODELS_DIR",
+            "note": f"Using MODELS_DIR/pi3/{owner_id} from the environment.",
+        }
+    if config.ext_dir.parent.name.lower() == "extensions":
+        return {
+            "path": config.ext_dir.parent.parent / "models" / EXTENSION_ID / owner_id,
+            "source": "modly_home_sibling",
+            "note": "Using the sibling Modly models directory.",
+        }
+    return {
+        "path": config.ext_dir / "models" / EXTENSION_ID / owner_id,
+        "source": "extension_local_fallback",
+        "note": "Using the extension-local models directory fallback.",
+    }
+
+
+def node_weight_diagnostics(config: SetupConfig) -> dict[str, dict[str, Any]]:
+    diagnostics: dict[str, dict[str, Any]] = {}
+    for node_id, weight in NODE_WEIGHTS.items():
+        resolution = resolve_node_model_dir(config, node_id)
+        weights_path = resolution["path"] / DOWNLOAD_CHECK
+        present = weights_path.is_file()
+        diagnostics[node_id] = {
+            "node_id": node_id,
+            "model_id": f"{EXTENSION_ID}/{node_id}",
+            "hf_repo": weight["hf_repo"],
+            "download_check": DOWNLOAD_CHECK,
+            "expected_model_dir": str(resolution["path"]),
+            "expected_weights_path": str(weights_path),
+            "weights_present": present,
+            "status": "ready" if present else "needs_weights",
+        }
+    return diagnostics
+
+
+def overall_setup_status(
+    *, dependencies_ok: bool, node_diagnostics: dict[str, dict[str, Any]]
+) -> str:
+    if not dependencies_ok:
+        return "needs_dependencies"
+    generate_diagnostic = node_diagnostics.get(NODE_ID)
+    if generate_diagnostic is None or not generate_diagnostic["weights_present"]:
+        return "needs_weights"
+    return "ready"
 
 
 def parse_setup_config(argv: list[str]) -> SetupConfig:
@@ -302,7 +389,7 @@ if imports.get("torchvision"):
         result["torchvision"] = {"version": getattr(torchvision, "__version__", None)}
     except Exception as exc:
         result["torchvision"] = {"error": f"{type(exc).__name__}: {exc}"}
-print(json.dumps(result, sort_keys=True))
+print(json.dumps(result, sort_keys=True, allow_nan=False))
 """ % (DEPENDENCY_IMPORTS,)
     proc = subprocess.run(
         [str(python_exe), "-c", script],
@@ -336,7 +423,7 @@ try:
 except Exception as exc:
     result["smoke_ok"] = False
     result["smoke_error"] = f"{type(exc).__name__}: {exc}"
-print(json.dumps(result, sort_keys=True))
+print(json.dumps(result, sort_keys=True, allow_nan=False))
 """
     proc = subprocess.run(
         [str(python_exe), "-c", script],
@@ -677,7 +764,7 @@ def pip_command(
     }
     append_log(log_path, "Running: " + " ".join(cmd))
     if log_env:
-        append_log(log_path, "Build environment: " + json.dumps(log_env, sort_keys=True))
+        append_log(log_path, "Build environment: " + json.dumps(log_env, sort_keys=True, allow_nan=False))
     proc = subprocess.run(
         cmd,
         text=True,
@@ -910,6 +997,7 @@ def write_status(config: SetupConfig, status: str, details: dict[str, Any]) -> P
     status_path = config.ext_dir / STATUS_RELATIVE_PATH
     status_path.parent.mkdir(parents=True, exist_ok=True)
     model_dir_resolution = resolve_expected_model_dir(config)
+    node_diagnostics = node_weight_diagnostics(config)
     runtime_python_exe = str(details.get("runtime_python_exe") or config.python_exe)
     payload = {
         "schema": "modly.setup-status.v1",
@@ -934,6 +1022,7 @@ def write_status(config: SetupConfig, status: str, details: dict[str, Any]) -> P
         "weights_present": (model_dir_resolution["path"] / DOWNLOAD_CHECK).is_file(),
         "weights_managed_by": "modly-ui",
         "default_downloads": False,
+        "nodes": node_diagnostics,
         "torch_install_lane": details.get("torch_install", {}).get("lane"),
         "torch_install_index_url": details.get("torch_install", {}).get("index_url"),
         "torch_packages": details.get("torch_install", {}).get("packages"),
@@ -947,7 +1036,7 @@ def write_status(config: SetupConfig, status: str, details: dict[str, Any]) -> P
         "details": details,
     }
     tmp_path = status_path.with_suffix(".json.tmp")
-    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
     os.replace(tmp_path, status_path)
     return status_path
 
@@ -961,7 +1050,7 @@ def main(argv: list[str]) -> int:
 
     if config.download_models:
         log(
-            "--download-models is intentionally unsupported. Use Modly's model-download UI for yyfz233/Pi3/model.safetensors.",
+            "--download-models is intentionally unsupported. Use Modly's UI for the independent yyfz233/Pi3 and yyfz233/Pi3X checkpoints.",
             stream=sys.stderr,
         )
         return 2
@@ -972,7 +1061,12 @@ def main(argv: list[str]) -> int:
 
     append_log(log_path, f"Started at {utc_now()}")
     append_log(log_path, f"Extension dir: {config.ext_dir}")
-    append_log(log_path, f"Expected weights ({model_dir_resolution['source']}): {model_dir_resolution['path'] / DOWNLOAD_CHECK}")
+    for node_id, diagnostic in node_weight_diagnostics(config).items():
+        append_log(
+            log_path,
+            f"{EXTENSION_ID}/{node_id} expected weights: {diagnostic['expected_weights_path']} "
+            f"(repo={diagnostic['hf_repo']}, status={diagnostic['status']})",
+        )
     torch_install_plan = select_torch_install_plan(config)
     if config.build_flash_attn_wheel:
         return build_flash_attn_wheel(config, log_path, torch_install_plan)
@@ -989,6 +1083,7 @@ def main(argv: list[str]) -> int:
         "expected_model_dir_source": model_dir_resolution["source"],
         "expected_model_dir_note": model_dir_resolution.get("note"),
         "vendored_pi3_present": (SCRIPT_DIR / "pi3_vendor" / "pi3" / "models" / "pi3.py").is_file(),
+        "vendored_pi3x_present": (SCRIPT_DIR / "pi3_vendor" / "pi3" / "models" / "pi3x.py").is_file(),
         "missing_dependencies_before": [],
         "missing_dependencies_after": [],
         "missing_base_dependencies_before_install": [],
@@ -1024,7 +1119,11 @@ def main(argv: list[str]) -> int:
     details["notes"].append(torch_install_plan["note"])
 
     log(f"Preparing extension at {config.ext_dir}")
-    log(f"Expected Modly-managed weights ({model_dir_resolution['source']}): {model_dir_resolution['path'] / DOWNLOAD_CHECK}")
+    for node_id, diagnostic in node_weight_diagnostics(config).items():
+        log(
+            f"{EXTENSION_ID}/{node_id} Modly-managed weights: {diagnostic['expected_weights_path']} "
+            f"(repo={diagnostic['hf_repo']}, status={diagnostic['status']})"
+        )
     log(f"Selected PyTorch install lane: {torch_install_plan['lane']} ({torch_install_plan['index_url']})")
 
     try:
@@ -1094,7 +1193,7 @@ def main(argv: list[str]) -> int:
         if details["flash_attn"].get("attempted"):
             details["install_attempted"] = True
         if details["flash_attn"].get("status") == "failed":
-            status_path = write_status(config, "failed", details)
+            status_path = write_status(config, "needs_dependencies", details)
             log(f"Setup failed: {details['flash_attn'].get('error')}", stream=sys.stderr)
             log(f"Status written to {status_path}")
             return 1
@@ -1119,13 +1218,13 @@ def main(argv: list[str]) -> int:
                 "CUDA is expected, but the flash_attn package is missing or failed to import. PyTorch SDPA fallback exists, but package FlashAttention is the primary public-extension acceleration path."
             )
             if not (config.validate_only or config.no_install):
-                status_path = write_status(config, "failed", details)
+                status_path = write_status(config, "needs_dependencies", details)
                 log("Setup failed: flash_attn package is unavailable after setup.", stream=sys.stderr)
                 log(f"Status written to {status_path}")
                 return 1
 
         if missing_after and not (config.validate_only or config.no_install):
-            status_path = write_status(config, "failed", details)
+            status_path = write_status(config, "needs_dependencies", details)
             log(f"Setup failed: missing imports after install: {', '.join(missing_after)}", stream=sys.stderr)
             log(f"Status written to {status_path}")
             return 1
@@ -1144,22 +1243,35 @@ def main(argv: list[str]) -> int:
             details["notes"].append(
                 "CUDA was expected, but a tiny CUDA tensor smoke probe failed after dependency setup."
             )
-            status_path = write_status(config, "failed", details)
+            status_path = write_status(config, "needs_dependencies", details)
             log("Setup failed: CUDA smoke probe failed after dependency setup.", stream=sys.stderr)
             log(f"Status written to {status_path}")
             return 1
 
-        if not config.expected_weights_path.is_file():
-            details["notes"].append("Weights are not present yet. This is expected until the Modly UI downloads them.")
-            status = "needs_weights" if not missing_after and not flash_attn_missing_after else "needs_dependencies"
-            status_path = write_status(config, status, details)
-            log("Weights not found yet; setup still succeeds because Modly UI manages HF downloads.")
+        weight_diagnostics = node_weight_diagnostics(config)
+        details["node_weights"] = weight_diagnostics
+        missing_weight_nodes = [node_id for node_id, item in weight_diagnostics.items() if not item["weights_present"]]
+        overall_status = overall_setup_status(
+            dependencies_ok=not missing_after and not flash_attn_missing_after,
+            node_diagnostics=weight_diagnostics,
+        )
+        if missing_weight_nodes:
+            details["notes"].append(
+                "Weights are not present yet for: "
+                + ", ".join(f"{EXTENSION_ID}/{node_id}" for node_id in missing_weight_nodes)
+                + ". This is expected until the Modly UI downloads them."
+            )
+            status_path = write_status(config, overall_status, details)
+            log(
+                "Weights not found for "
+                + ", ".join(f"{EXTENSION_ID}/{node_id}" for node_id in missing_weight_nodes)
+                + "; setup still succeeds because Modly UI manages HF downloads."
+            )
             log(f"Status written to {status_path}")
             return 0
 
-        status = "ready" if not missing_after and not flash_attn_missing_after else "needs_dependencies"
-        status_path = write_status(config, status, details)
-        log(f"Setup readiness status: {status}")
+        status_path = write_status(config, overall_status, details)
+        log(f"Setup readiness status: {overall_status}")
         log(f"Status written to {status_path}")
         return 0
 

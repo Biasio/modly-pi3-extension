@@ -9,11 +9,14 @@ import io
 import json
 import os
 import re
+import shutil
 import struct
 import sys
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 try:
@@ -47,6 +50,49 @@ MANIFEST_PATH = EXTENSION_DIR / "manifest.json"
 VENDOR_ROOT = EXTENSION_DIR / "pi3_vendor"
 DEFAULT_MODEL_DIR = EXTENSION_DIR / "models" / EXTENSION_ID / NODE_ID
 SETUP_STATUS_PATH = EXTENSION_DIR / ".modly" / "setup" / "setup-status.json"
+
+
+@dataclass(frozen=True)
+class NodeConfig:
+    node_id: str
+    model_id: str
+    display_name: str
+    hf_repo: str
+    owner_id: str
+    default_name: str
+    vram_gb: int
+
+    @property
+    def model_dir(self) -> Path:
+        return EXTENSION_DIR / "models" / EXTENSION_ID / self.owner_id
+
+
+NODE_CONFIGS: Mapping[str, NodeConfig] = MappingProxyType(
+    {
+        "generate": NodeConfig(
+            node_id="generate",
+            model_id="pi3/generate",
+            display_name="Pi3 Point Cloud",
+            hf_repo="yyfz233/Pi3",
+            owner_id="generate",
+            default_name="pi3_point_cloud",
+            vram_gb=10,
+        ),
+        "pi3x": NodeConfig(
+            node_id="pi3x",
+            model_id="pi3/pi3x",
+            display_name="Pi3X Multi-View Point Cloud",
+            hf_repo="yyfz233/Pi3X",
+            owner_id="pi3x",
+            default_name="pi3x_point_cloud",
+            vram_gb=12,
+        ),
+    }
+)
+
+PI3X_OMITTED_MULTIMODAL_PREFIXES = ("depth_encoder.", "depth_emb", "ray_embed.", "pose_inject_blk.")
+SIDE_VIEW_PARAMS = (("left", "left_image_path"), ("back", "back_image_path"), ("right", "right_image_path"))
+SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 
 DEPENDENCY_IMPORTS: dict[str, str] = {
     "torch": "torch",
@@ -100,9 +146,9 @@ def _schema_for_node(node_id: str = NODE_ID) -> list[dict[str, Any]]:
     return []
 
 
-def _schema_defaults() -> dict[str, Any]:
+def _schema_defaults(node_id: str = NODE_ID) -> dict[str, Any]:
     defaults: dict[str, Any] = {}
-    for item in _schema_for_node(NODE_ID):
+    for item in _schema_for_node(node_id):
         if isinstance(item, dict) and isinstance(item.get("id"), str) and "default" in item:
             defaults[item["id"]] = item["default"]
     return defaults
@@ -199,16 +245,24 @@ def _env_path(name: str) -> Path | None:
     return Path(value).expanduser()
 
 
-def _modly_home_model_dir() -> Path | None:
+def _modly_home_model_dir(owner_id: str = NODE_ID) -> Path | None:
     if EXTENSION_DIR.parent.name.lower() != "extensions":
         return None
-    return EXTENSION_DIR.parent.parent / "models" / EXTENSION_ID / NODE_ID
+    return EXTENSION_DIR.parent.parent / "models" / EXTENSION_ID / owner_id
 
 
-def _model_dir_variants(path: Path) -> list[Path]:
+def _model_dir_variants(path: Path, owner_id: str = NODE_ID) -> list[Path]:
+    if path.name == DOWNLOAD_CHECK:
+        if path.parent.name == owner_id and path.parent.parent.name == EXTENSION_ID:
+            return [path]
+        if path.parent.name in NODE_CONFIGS and path.parent.parent.name == EXTENSION_ID:
+            return [path.parent.parent / owner_id / DOWNLOAD_CHECK]
+        return []
+    if path.name in NODE_CONFIGS and path.name != owner_id and path.parent.name == EXTENSION_ID:
+        return [path.parent / owner_id]
     variants = [path]
-    if path.name != DOWNLOAD_CHECK and not (path.name == NODE_ID and path.parent.name == EXTENSION_ID):
-        variants.append(path / EXTENSION_ID / NODE_ID)
+    if path.name != DOWNLOAD_CHECK and not (path.name == owner_id and path.parent.name == EXTENSION_ID):
+        variants.append(path / EXTENSION_ID / owner_id)
     return variants
 
 
@@ -250,13 +304,230 @@ def _sanitize_output_base(value: Any) -> str:
     return text
 
 
-def _unique_output_paths(outputs_dir: Path, base_name: str) -> tuple[Path, Path]:
-    glb_path = outputs_dir / f"{base_name}.glb"
-    ply_path = outputs_dir / f"{base_name}.ply"
-    if not glb_path.exists() and not ply_path.exists():
-        return glb_path, ply_path
-    unique_base = f"{base_name}_{uuid.uuid4().hex[:8]}"
-    return outputs_dir / f"{unique_base}.glb", outputs_dir / f"{unique_base}.ply"
+@dataclass(frozen=True)
+class _OutputReservation:
+    base_name: str
+    marker_path: Path
+    token: str
+
+    def release(self) -> None:
+        try:
+            if self.marker_path.read_text(encoding="ascii") == self.token:
+                self.marker_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _reserve_output_base(
+    outputs_dir: Path,
+    base_name: str,
+    names_for_base: Callable[[str], list[str]],
+) -> _OutputReservation:
+    """Atomically reserve a collision-free output base in outputs_dir."""
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    candidate = base_name
+    while True:
+        token = uuid.uuid4().hex
+        marker = outputs_dir / f".{candidate}.pi3-reservation"
+        try:
+            fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            candidate = f"{base_name}_{uuid.uuid4().hex[:8]}"
+            continue
+        try:
+            os.write(fd, token.encode("ascii"))
+        finally:
+            os.close(fd)
+        reservation = _OutputReservation(candidate, marker, token)
+        if any((outputs_dir / name).exists() for name in names_for_base(candidate)):
+            reservation.release()
+            candidate = f"{base_name}_{uuid.uuid4().hex[:8]}"
+            continue
+        return reservation
+
+
+def _pi3x_bundle_names(base_name: str, view_names: list[str]) -> list[str]:
+    names = [
+        f"{base_name}.glb",
+        f"{base_name}.ply",
+        f"{base_name}_pi3x.npz",
+        f"{base_name}_metadata.json",
+    ]
+    for view_name in view_names:
+        names.extend(
+            [
+                f"{base_name}_depth_{view_name}.png",
+                f"{base_name}_confidence_{view_name}.png",
+            ]
+        )
+    return names
+
+
+def _validate_finite_array(name: str, value: Any, *, positive: bool = False) -> None:
+    import numpy as np
+
+    array = np.asarray(_tensor_to_numpy(value))
+    try:
+        finite = np.isfinite(array)
+    except TypeError as exc:
+        raise RuntimeError(f"pi3/pi3x output {name} is not numeric and cannot be exported.") from exc
+    if not bool(finite.all()):
+        raise RuntimeError(f"pi3/pi3x output {name} contains NaN or infinite values; no artifacts were published.")
+    if positive and (array.size == 0 or not bool((array > 0).all())):
+        raise RuntimeError(f"pi3/pi3x output {name} must be finite and positive; no artifacts were published.")
+
+
+def _validate_pi3x_arrays(arrays: Mapping[str, Any]) -> None:
+    required = (
+        "points", "local_points", "depth", "rays", "confidence_logits", "confidence",
+        "camera_poses", "intrinsics", "metric", "colors",
+    )
+    missing = [name for name in required if name not in arrays]
+    if missing:
+        raise RuntimeError("pi3/pi3x export omitted required numeric arrays: " + ", ".join(missing))
+    for name in required:
+        _validate_finite_array(name, arrays[name], positive=name == "metric")
+
+
+def _validate_pi3x_state_keys(missing_keys: list[str], unexpected_keys: list[str]) -> None:
+    missing_core = [key for key in missing_keys if not key.startswith(PI3X_OMITTED_MULTIMODAL_PREFIXES)]
+    unexpected_core = [key for key in unexpected_keys if not key.startswith(PI3X_OMITTED_MULTIMODAL_PREFIXES)]
+    if missing_core or unexpected_core:
+        missing_preview = ", ".join(missing_core[:5]) or "none"
+        unexpected_preview = ", ".join(unexpected_core[:5]) or "none"
+        raise RuntimeError(
+            "pi3/pi3x checkpoint is incompatible with image-only Pi3X. "
+            f"Missing core keys ({len(missing_core)}): {missing_preview}; "
+            f"unexpected non-multimodal keys ({len(unexpected_core)}): {unexpected_preview}."
+        )
+
+
+def _resolve_side_image_path(value: Any, workspace_dir: Path, port_name: str) -> Path:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{port_name} is empty.")
+    root = workspace_dir.expanduser().resolve(strict=True)
+    candidate = Path(text).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"pi3/pi3x rejected {port_name}: the image must resolve inside WORKSPACE_DIR ({root})."
+        ) from exc
+    if not resolved.is_file():
+        raise ValueError(f"pi3/pi3x rejected {port_name}: {resolved} is not a regular file.")
+    if resolved.suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
+        supported = ", ".join(sorted(SUPPORTED_IMAGE_EXTENSIONS))
+        raise ValueError(f"pi3/pi3x rejected {port_name}: unsupported image extension; expected one of {supported}.")
+    return resolved
+
+
+def _prepare_pi3x_views(
+    image_bytes: bytes,
+    params: Mapping[str, Any],
+    input_dir: Path,
+    cancel_evt: Any | None = None,
+) -> list[str]:
+    from PIL import Image
+
+    view_sources: list[tuple[str, io.BytesIO | Path]] = [("front", io.BytesIO(image_bytes))]
+    side_values = [(view_name, port_name, params.get(port_name)) for view_name, port_name in SIDE_VIEW_PARAMS]
+    present_sides = [(view_name, port_name, value) for view_name, port_name, value in side_values if str(value or "").strip()]
+    if present_sides:
+        workspace_value = os.environ.get("WORKSPACE_DIR")
+        if not workspace_value or not workspace_value.strip():
+            raise ValueError("pi3/pi3x requires WORKSPACE_DIR when optional side-image paths are provided.")
+        workspace_dir = Path(workspace_value)
+        for view_name, port_name, value in present_sides:
+            _raise_if_cancelled(cancel_evt)
+            view_sources.append((view_name, _resolve_side_image_path(value, workspace_dir, port_name)))
+
+    input_dir.mkdir(parents=True, exist_ok=True)
+    view_names: list[str] = []
+    for canonical_index, (view_name, source) in enumerate(view_sources):
+        _raise_if_cancelled(cancel_evt)
+        try:
+            with Image.open(source) as image:
+                image.load()
+                image.convert("RGB").save(input_dir / f"{canonical_index:02d}_{view_name}.png")
+        except Exception as exc:
+            raise ValueError(f"pi3/pi3x could not decode the {view_name} image as a supported image file.") from exc
+        view_names.append(view_name)
+    return view_names
+
+
+def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        serialized = json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+        temporary.write_text(serialized, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_pi3x_sidecars(
+    stage_dir: Path,
+    base_name: str,
+    *,
+    arrays: Mapping[str, Any],
+    metadata: dict[str, Any],
+    view_names: list[str],
+    cancel_evt: Any | None = None,
+    progress_cb: Callable[..., Any] | None = None,
+) -> list[Path]:
+    import numpy as np
+    from PIL import Image
+
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    npz_path = stage_dir / f"{base_name}_pi3x.npz"
+    metadata_path = stage_dir / f"{base_name}_metadata.json"
+    depth = np.asarray(arrays["depth"], dtype=np.float32)
+    confidence = np.asarray(arrays["confidence"], dtype=np.float32)
+    valid_mask = np.asarray(arrays["valid_mask"], dtype=bool)
+    depth_normalization: dict[str, dict[str, float | None]] = {}
+
+    _validate_pi3x_arrays(arrays)
+    json.dumps(metadata, allow_nan=False)
+    _raise_if_cancelled(cancel_evt)
+    _progress(progress_cb, 91, "Writing pi3/pi3x NPZ sidecar")
+    np.savez_compressed(
+        npz_path,
+        **{key: np.asarray(value) for key, value in arrays.items()},
+        view_names=np.asarray(view_names),
+    )
+
+    written = [npz_path]
+    for index, view_name in enumerate(view_names):
+        _raise_if_cancelled(cancel_evt)
+        _progress(progress_cb, 92 + index, f"Writing pi3/pi3x {view_name} previews")
+        view_depth = depth[index]
+        finite_valid = np.isfinite(view_depth) & valid_mask[index]
+        normalized = np.zeros(view_depth.shape, dtype=np.uint16)
+        low: float | None = None
+        high: float | None = None
+        if finite_valid.any():
+            low, high = (float(value) for value in np.percentile(view_depth[finite_valid], [2.0, 98.0]))
+            if high <= low:
+                high = low + max(abs(low) * 1e-6, 1e-6)
+            scaled = np.clip((view_depth - low) / (high - low), 0.0, 1.0)
+            normalized[finite_valid] = np.rint(scaled[finite_valid] * 65535.0).astype(np.uint16)
+        depth_path = stage_dir / f"{base_name}_depth_{view_name}.png"
+        Image.fromarray(normalized, mode="I;16").save(depth_path)
+        confidence_path = stage_dir / f"{base_name}_confidence_{view_name}.png"
+        confidence_u8 = np.rint(np.clip(confidence[index], 0.0, 1.0) * 255.0).astype(np.uint8)
+        Image.fromarray(confidence_u8, mode="L").save(confidence_path)
+        depth_normalization[view_name] = {"percentile_2": low, "percentile_98": high}
+        written.extend([depth_path, confidence_path])
+
+    _raise_if_cancelled(cancel_evt)
+    metadata["depth_preview_normalization"] = depth_normalization
+    _atomic_write_json(metadata_path, metadata)
+    written.append(metadata_path)
+    return written
 
 
 def _align4(data: bytes, pad: bytes = b"\x00") -> bytes:
@@ -271,6 +542,8 @@ def _tensor_to_numpy(value: Any) -> Any:
         value = value.detach()
     if hasattr(value, "cpu"):
         value = value.cpu()
+    if "bfloat16" in str(getattr(value, "dtype", "")) and hasattr(value, "float"):
+        value = value.float()
     if hasattr(value, "numpy"):
         return value.numpy()
     return value
@@ -287,6 +560,10 @@ def _write_point_cloud_glb(points: Any, colors: Any, path: Path) -> None:
         )
     if positions.shape[0] == 0:
         raise ValueError("Cannot write a GLB point cloud with zero points.")
+    if not np.isfinite(positions).all():
+        raise RuntimeError("pi3 point-cloud positions contain NaN or infinite values; GLB was not written.")
+    if not np.isfinite(color_values).all():
+        raise RuntimeError("pi3 point-cloud colors contain NaN or infinite values; GLB was not written.")
 
     if color_values.max(initial=0.0) > 1.0:
         color_values = color_values / 255.0
@@ -343,7 +620,7 @@ def _write_point_cloud_glb(points: Any, colors: Any, path: Path) -> None:
         ],
     }
 
-    json_chunk = _align4(json.dumps(gltf, separators=(",", ":")).encode("utf-8"), b" ")
+    json_chunk = _align4(json.dumps(gltf, separators=(",", ":"), allow_nan=False).encode("utf-8"), b" ")
     total_length = 12 + 8 + len(json_chunk) + 8 + len(binary_blob)
     path.write_bytes(
         b"glTF"
@@ -379,28 +656,44 @@ class Pi3Generator(BaseGenerator):
         self.hf_skip_prefixes = list(HF_SKIP_PREFIXES)
         self._model: Any | None = None
         self._loaded_weights_path: Path | None = None
+        self._loaded_node_id: str | None = None
         self._device_label: str | None = None
         self._dtype_label: str | None = None
+        self.node_id = getattr(self, "node_id", NODE_ID)
+
+    def _node_config(self) -> NodeConfig:
+        node_id = str(getattr(self, "node_id", NODE_ID) or NODE_ID)
+        config = NODE_CONFIGS.get(node_id)
+        if config is None:
+            expected = ", ".join(sorted(NODE_CONFIGS))
+            raise ValueError(f"Unknown Pi3 node {node_id!r}; expected one of: {expected}.")
+        self.download_check = DOWNLOAD_CHECK
+        self.hf_repo = config.hf_repo
+        self.MODEL_ID = config.model_id
+        self.DISPLAY_NAME = config.display_name
+        self.VRAM_GB = config.vram_gb
+        return config
 
     def _candidate_model_dirs(self) -> list[Path]:
+        config = self._node_config()
         candidates: list[Path] = []
 
         env_model_dir = _env_path("MODEL_DIR")
         if env_model_dir is not None:
-            candidates.extend(_model_dir_variants(env_model_dir))
+            candidates.extend(_model_dir_variants(env_model_dir, config.owner_id))
 
         env_models_dir = _env_path("MODELS_DIR")
         if env_models_dir is not None:
-            candidates.append(env_models_dir / EXTENSION_ID / NODE_ID)
+            candidates.append(env_models_dir / EXTENSION_ID / config.owner_id)
 
         if self._provided_model_dir is not None:
-            candidates.extend(_model_dir_variants(self._provided_model_dir))
+            candidates.extend(_model_dir_variants(self._provided_model_dir, config.owner_id))
 
-        sibling_model_dir = _modly_home_model_dir()
+        sibling_model_dir = _modly_home_model_dir(config.owner_id)
         if sibling_model_dir is not None:
             candidates.append(sibling_model_dir)
 
-        candidates.append(DEFAULT_MODEL_DIR)
+        candidates.append(config.model_dir)
 
         deduped: list[Path] = []
         seen: set[str] = set()
@@ -416,20 +709,28 @@ class Pi3Generator(BaseGenerator):
         return deduped
 
     def _find_weights_path(self) -> Path | None:
+        config = self._node_config()
         for candidate in self._candidate_model_dirs():
-            if candidate.is_file() and candidate.name == DOWNLOAD_CHECK:
-                return candidate
-            path = candidate / DOWNLOAD_CHECK
-            if path.is_file():
-                return path
+            path = candidate if candidate.name == DOWNLOAD_CHECK else candidate / DOWNLOAD_CHECK
+            if not path.is_file():
+                continue
+            try:
+                resolved = path.resolve(strict=True)
+            except OSError:
+                continue
+            owner_dir = resolved.parent
+            if owner_dir.name != config.owner_id or owner_dir.parent.name != EXTENSION_ID:
+                continue
+            return resolved
         return None
 
     def _expected_weights_path(self) -> Path:
+        config = self._node_config()
         for candidate in self._candidate_model_dirs():
             if candidate.name == DOWNLOAD_CHECK:
                 return candidate
             return candidate / DOWNLOAD_CHECK
-        return DEFAULT_MODEL_DIR / DOWNLOAD_CHECK
+        return config.model_dir / DOWNLOAD_CHECK
 
     def is_loaded(self) -> bool:
         return self._model is not None
@@ -438,12 +739,13 @@ class Pi3Generator(BaseGenerator):
         return self._find_weights_path() is not None
 
     def readiness_status(self) -> dict[str, Any]:
+        config = self._node_config()
         missing = _missing_dependencies()
         weights_path = self._find_weights_path()
         setup_status = _read_json(SETUP_STATUS_PATH)
         details = {
-            "model_id": MODEL_ID,
-            "hf_repo": HF_REPO,
+            "model_id": config.model_id,
+            "hf_repo": config.hf_repo,
             "download_check": DOWNLOAD_CHECK,
             "candidate_model_dirs": [str(path) for path in self._candidate_model_dirs()],
             "expected_weights_path": str(self._expected_weights_path()),
@@ -463,22 +765,26 @@ class Pi3Generator(BaseGenerator):
             return _readiness_result(
                 ok=False,
                 machine_code="missing_weights",
-                label_hint="Download Pi3 weights",
-                reason="Pi3 weights are not present. Use Modly UI to download yyfz233/Pi3/model.safetensors.",
+                label_hint=f"Download {config.display_name} weights",
+                reason=(
+                    f"{config.model_id} weights are not present. Use Modly UI to download "
+                    f"{config.hf_repo}/model.safetensors."
+                ),
                 details=details,
             )
         return _readiness_result(
             ok=True,
             machine_code="ready",
             label_hint="Ready",
-            reason="Pi3 dependencies and model.safetensors are available.",
+            reason=f"{config.model_id} dependencies and model.safetensors are available.",
             details=details,
         )
 
     def _select_device_and_dtype(self, params: Mapping[str, Any]) -> tuple[Any, str, Any, str]:
         import torch
 
-        defaults = _schema_defaults()
+        config = self._node_config()
+        defaults = _schema_defaults(config.node_id)
         requested_device = _safe_choice(_param(params, defaults, "device", "auto"), {"auto", "cuda", "cpu"}, "auto")
         requested_dtype = _safe_choice(
             _param(params, defaults, "torch_dtype", "auto"),
@@ -493,9 +799,9 @@ class Pi3Generator(BaseGenerator):
             device_label = requested_device
 
         if device_label == "cuda" and not cuda_available:
-            raise RuntimeError("CUDA was requested for Pi3, but torch.cuda.is_available() is false in this runtime.")
+            raise RuntimeError(f"CUDA was requested for {config.model_id}, but torch.cuda.is_available() is false.")
         if device_label == "cpu":
-            _log("CPU execution selected for Pi3. This is supported for correctness but can be extremely slow and memory-heavy.")
+            _log(f"{config.model_id}: CPU execution is supported but can be extremely slow and memory-heavy.")
 
         if device_label == "cuda":
             if requested_dtype == "auto":
@@ -524,17 +830,20 @@ class Pi3Generator(BaseGenerator):
         cancel_evt: Any | None = None,
     ) -> None:
         params = params or {}
+        config = self._node_config()
         _raise_if_cancelled(cancel_evt)
         missing = _missing_dependencies()
         if missing:
-            raise RuntimeError("Pi3 runtime dependencies are missing: " + ", ".join(missing) + ". Run extension setup first.")
+            raise RuntimeError(
+                f"{config.model_id} runtime dependencies are missing: " + ", ".join(missing) + ". Run setup first."
+            )
 
         weights_path = self._find_weights_path()
         if weights_path is None:
             searched = ", ".join(str(path) for path in self._candidate_model_dirs())
             raise FileNotFoundError(
-                "Pi3 model.safetensors was not found. Use the Modly UI to download yyfz233/Pi3 into "
-                f"models/pi3/generate/. Searched: {searched}"
+                f"{config.model_id} model.safetensors was not found. Use the Modly UI to download "
+                f"{config.hf_repo} into models/pi3/{config.owner_id}/. Searched: {searched}"
             )
 
         import torch
@@ -543,6 +852,7 @@ class Pi3Generator(BaseGenerator):
         device, device_label, _dtype, dtype_label = self._select_device_and_dtype(params)
         if (
             self._model is not None
+            and self._loaded_node_id == config.node_id
             and self._loaded_weights_path == weights_path
             and self._device_label == device_label
             and self._dtype_label == dtype_label
@@ -550,41 +860,50 @@ class Pi3Generator(BaseGenerator):
             return
 
         self.unload()
-        _progress(progress_cb, 20, "Loading Pi3 source")
+        _progress(progress_cb, 20, f"Loading {config.model_id} source")
         _raise_if_cancelled(cancel_evt)
         _ensure_vendor_import_path()
 
         with contextlib.redirect_stdout(sys.stderr):
-            from pi3.models.pi3 import Pi3
+            if config.node_id == "generate":
+                from pi3.models.pi3 import Pi3
+                model_type = Pi3
+            else:
+                from pi3.models.pi3x import Pi3X
+                model_type = Pi3X
 
-        _progress(progress_cb, 30, "Instantiating Pi3")
+        _progress(progress_cb, 30, f"Instantiating {config.model_id}")
         _raise_if_cancelled(cancel_evt)
         with contextlib.redirect_stdout(sys.stderr):
-            model = Pi3()
+            model = model_type() if config.node_id == "generate" else model_type(use_multimodal=False).eval()
 
         _progress(progress_cb, 40, "Loading local model.safetensors")
         _raise_if_cancelled(cancel_evt)
         state_dict = load_file(str(weights_path), device="cpu")
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-        if missing_keys or unexpected_keys:
+        if config.node_id == "pi3x":
+            _validate_pi3x_state_keys(list(missing_keys), list(unexpected_keys))
+        elif missing_keys or unexpected_keys:
             raise RuntimeError(
-                "Pi3 checkpoint did not match the vendored model. "
+                "pi3/generate checkpoint did not match the vendored model. "
                 f"Missing keys: {len(missing_keys)}; unexpected keys: {len(unexpected_keys)}."
             )
 
-        _progress(progress_cb, 55, f"Moving Pi3 to {device_label}")
+        _progress(progress_cb, 55, f"Moving {config.model_id} to {device_label}")
         _raise_if_cancelled(cancel_evt)
         model = model.to(device).eval()
         self._model = model
+        self._loaded_node_id = config.node_id
         self._loaded_weights_path = weights_path
         self._device_label = device_label
         self._dtype_label = dtype_label
-        _log(f"Loaded Pi3 weights from {weights_path} on {device_label} with {dtype_label} autocast.")
+        _log(f"{config.model_id}: loaded weights from {weights_path} on {device_label} with {dtype_label} autocast.")
 
     def unload(self) -> None:
         model = self._model
         self._model = None
         self._loaded_weights_path = None
+        self._loaded_node_id = None
         self._device_label = None
         self._dtype_label = None
         if model is not None:
@@ -605,23 +924,48 @@ class Pi3Generator(BaseGenerator):
         progress_cb: Callable[..., Any] | None = None,
         cancel_evt: Any | None = None,
     ) -> Path:
-        params = params or {}
-        defaults = _schema_defaults()
-        if not image_bytes:
-            raise ValueError("Pi3 requires non-empty image_bytes input.")
+        config = self._node_config()
+        if config.node_id == "generate":
+            return self._generate_pi3(image_bytes, params, progress_cb, cancel_evt)
+        return self._generate_pi3x(image_bytes, params, progress_cb, cancel_evt)
 
-        _log("Starting Pi3 generation.")
+    def _generate_pi3(
+        self,
+        image_bytes: bytes,
+        params: Mapping[str, Any] | None,
+        progress_cb: Callable[..., Any] | None = None,
+        cancel_evt: Any | None = None,
+    ) -> Path:
+        params = params or {}
+        if not image_bytes:
+            raise ValueError("pi3/generate requires non-empty image_bytes input.")
+
+        _log("pi3/generate: starting generation.")
         _progress(progress_cb, 2, "Preparing Pi3 input")
         _raise_if_cancelled(cancel_evt)
         self.outputs_dir.mkdir(parents=True, exist_ok=True)
         run_dir = self.outputs_dir / f"pi3_{uuid.uuid4().hex[:12]}"
+        try:
+            return self._generate_pi3_in_run_dir(run_dir, image_bytes, params, progress_cb, cancel_evt)
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    def _generate_pi3_in_run_dir(
+        self,
+        run_dir: Path,
+        image_bytes: bytes,
+        params: Mapping[str, Any],
+        progress_cb: Callable[..., Any] | None,
+        cancel_evt: Any | None,
+    ) -> Path:
+        defaults = _schema_defaults("generate")
         input_dir = run_dir / "input"
         input_dir.mkdir(parents=True, exist_ok=True)
         input_path = input_dir / "input.png"
 
         missing = _missing_dependencies()
         if missing:
-            raise RuntimeError("Pi3 runtime dependencies are missing: " + ", ".join(missing) + ". Run extension setup first.")
+            raise RuntimeError("pi3/generate runtime dependencies are missing: " + ", ".join(missing) + ". Run extension setup first.")
 
         from PIL import Image
         import torch
@@ -633,7 +977,7 @@ class Pi3Generator(BaseGenerator):
         _raise_if_cancelled(cancel_evt)
         self.load(params=params, progress_cb=progress_cb, cancel_evt=cancel_evt)
         if self._model is None:
-            raise RuntimeError("Pi3 model failed to load.")
+            raise RuntimeError("pi3/generate model failed to load.")
 
         _ensure_vendor_import_path()
         with contextlib.redirect_stdout(sys.stderr):
@@ -650,7 +994,6 @@ class Pi3Generator(BaseGenerator):
         edge_rtol = _safe_float(_param(params, defaults, "edge_rtol", 0.03), 0.03, minimum=0.0, maximum=0.25)
         edge_filter = _safe_bool(_param(params, defaults, "edge_filter", "true"), True)
         output_base = _sanitize_output_base(_param(params, defaults, "output_name", "pi3_point_cloud"))
-        glb_output_path, ply_output_path = _unique_output_paths(self.outputs_dir, output_base)
 
         device = next(self._model.parameters()).device
         _progress(progress_cb, 30, "Preprocessing image")
@@ -658,11 +1001,11 @@ class Pi3Generator(BaseGenerator):
         with contextlib.redirect_stdout(sys.stderr):
             imgs = load_images_as_tensor(str(input_dir), interval=1, PIXEL_LIMIT=pixel_limit, verbose=False)
         if not getattr(imgs, "numel", lambda: 0)():
-            raise RuntimeError("Pi3 could not load the input image into a tensor.")
+            raise RuntimeError("pi3/generate could not load the input image into a tensor.")
         imgs = imgs.to(device)
 
         _log(
-            "Running Pi3 inference "
+            "pi3/generate: running inference "
             f"with pixel_limit={pixel_limit}, confidence_threshold={confidence_threshold}, "
             f"edge_filter={edge_filter}, edge_rtol={edge_rtol}."
         )
@@ -691,25 +1034,269 @@ class Pi3Generator(BaseGenerator):
         points = result["points"][0][masks]
         colors = imgs.permute(0, 2, 3, 1)[masks]
         retained_points = int(points.shape[0])
-        _log(f"Retained {retained_points} Pi3 point-cloud points after filtering.")
+        _log(f"pi3/generate: retained {retained_points} point-cloud points after filtering.")
         if points.numel() == 0:
             raise RuntimeError(
-                "Pi3 produced zero retained points. Lower confidence_threshold or disable edge_filter and try again."
+                "pi3/generate produced zero retained points. Lower confidence_threshold or disable edge_filter and try again."
             )
 
-        _progress(progress_cb, 90, "Writing PLY point-cloud sidecar")
-        _raise_if_cancelled(cancel_evt)
-        _log(f"Writing raw PLY point-cloud sidecar to {ply_output_path}.")
         points_cpu = points.detach().cpu()
         colors_cpu = colors.detach().cpu()
-        with contextlib.redirect_stdout(sys.stderr):
-            write_ply(points_cpu, colors_cpu, str(ply_output_path))
+        try:
+            _validate_finite_array("points", points_cpu)
+            _validate_finite_array("colors", colors_cpu)
+        except Exception:
+            shutil.rmtree(run_dir, ignore_errors=True)
+            raise
+        reservation = _reserve_output_base(
+            self.outputs_dir,
+            output_base,
+            lambda base: [f"{base}.glb", f"{base}.ply"],
+        )
+        glb_output_path = self.outputs_dir / f"{reservation.base_name}.glb"
+        ply_output_path = self.outputs_dir / f"{reservation.base_name}.ply"
+        stage_glb = run_dir / f".{reservation.base_name}.{reservation.token}.glb.tmp"
+        stage_ply = run_dir / f".{reservation.base_name}.{reservation.token}.ply.tmp"
+        promoted: list[Path] = []
+        try:
+            _progress(progress_cb, 90, "Writing PLY point-cloud sidecar")
+            _raise_if_cancelled(cancel_evt)
+            _log(f"Writing raw PLY point-cloud sidecar to {ply_output_path}.")
+            with contextlib.redirect_stdout(sys.stderr):
+                write_ply(points_cpu, colors_cpu, str(stage_ply))
 
-        _progress(progress_cb, 96, "Writing GLB point-cloud preview")
-        _raise_if_cancelled(cancel_evt)
-        _log(f"Writing GLB point-cloud preview to {glb_output_path}.")
-        _write_point_cloud_glb(points_cpu, colors_cpu, glb_output_path)
+            _progress(progress_cb, 96, "Writing GLB point-cloud preview")
+            _raise_if_cancelled(cancel_evt)
+            _log(f"Writing GLB point-cloud preview to {glb_output_path}.")
+            _write_point_cloud_glb(points_cpu, colors_cpu, stage_glb)
+            for staged, destination in ((stage_ply, ply_output_path), (stage_glb, glb_output_path)):
+                os.replace(staged, destination)
+                promoted.append(destination)
+        except Exception:
+            for path in promoted:
+                path.unlink(missing_ok=True)
+            raise
+        finally:
+            stage_glb.unlink(missing_ok=True)
+            stage_ply.unlink(missing_ok=True)
+            reservation.release()
+            shutil.rmtree(run_dir, ignore_errors=True)
 
         _progress(progress_cb, 100, "Pi3 point cloud complete")
-        _log(f"Pi3 generation complete. Returning {glb_output_path}; PLY sidecar retained at {ply_output_path}.")
+        _log(f"pi3/generate: complete. Returning {glb_output_path}; PLY sidecar retained at {ply_output_path}.")
         return glb_output_path
+
+    def _generate_pi3x(
+        self,
+        image_bytes: bytes,
+        params: Mapping[str, Any] | None,
+        progress_cb: Callable[..., Any] | None = None,
+        cancel_evt: Any | None = None,
+    ) -> Path:
+        params = params or {}
+        config = self._node_config()
+        defaults = _schema_defaults(config.node_id)
+        if not image_bytes:
+            raise ValueError("pi3/pi3x requires non-empty front image bytes.")
+
+        self.outputs_dir.mkdir(parents=True, exist_ok=True)
+        run_dir = self.outputs_dir / f"pi3x_{uuid.uuid4().hex[:12]}"
+        input_dir = run_dir / "input"
+        stage_dir = run_dir / "bundle"
+        promoted: list[Path] = []
+        reservation: _OutputReservation | None = None
+        try:
+            _log("pi3/pi3x: starting multi-view generation.")
+            _progress(progress_cb, 2, "Preparing pi3/pi3x views")
+            _raise_if_cancelled(cancel_evt)
+            view_names = _prepare_pi3x_views(image_bytes, params, input_dir, cancel_evt)
+            selected_ports = ["image"] + [port for view, port in SIDE_VIEW_PARAMS if view in view_names]
+            _log(f"pi3/pi3x: selected views {view_names}; workflow ports {selected_ports}.")
+
+            missing = _missing_dependencies()
+            if missing:
+                raise RuntimeError(
+                    "pi3/pi3x runtime dependencies are missing: " + ", ".join(missing) + ". Run extension setup first."
+                )
+
+            _progress(progress_cb, 12, "Loading pi3/pi3x model")
+            _raise_if_cancelled(cancel_evt)
+            self.load(params=params, progress_cb=progress_cb, cancel_evt=cancel_evt)
+            if self._model is None:
+                raise RuntimeError("pi3/pi3x model failed to load.")
+
+            import numpy as np
+            import torch
+
+            _ensure_vendor_import_path()
+            with contextlib.redirect_stdout(sys.stderr):
+                from pi3.utils.basic import load_images_as_tensor, write_ply
+                from pi3.utils.geometry import depth_normal_edge, recover_intrinsic_from_rays_d
+
+            pixel_limit = _safe_int(
+                _param(params, defaults, "pixel_limit", 255000), 255000, minimum=196, maximum=1200000
+            )
+            confidence_threshold = _safe_float(
+                _param(params, defaults, "confidence_threshold", 0.1), 0.1, minimum=0.0, maximum=1.0
+            )
+            edge_rtol = _safe_float(
+                _param(params, defaults, "edge_rtol", 0.03), 0.03, minimum=0.0, maximum=0.25
+            )
+            edge_filter = _safe_bool(_param(params, defaults, "edge_filter", "true"), True)
+            output_base = _sanitize_output_base(
+                _param(params, defaults, "output_name", config.default_name)
+            )
+            device = next(self._model.parameters()).device
+            _progress(progress_cb, 32, "Preprocessing pi3/pi3x views")
+            _raise_if_cancelled(cancel_evt)
+            with contextlib.redirect_stdout(sys.stderr):
+                imgs = load_images_as_tensor(str(input_dir), interval=1, PIXEL_LIMIT=pixel_limit, verbose=False)
+            if not getattr(imgs, "numel", lambda: 0)():
+                raise RuntimeError("pi3/pi3x could not load the selected views into a tensor.")
+            if int(imgs.shape[0]) != len(view_names):
+                raise RuntimeError(
+                    f"pi3/pi3x loaded {int(imgs.shape[0])} views but expected {len(view_names)} ({view_names})."
+                )
+            imgs = imgs.to(device)
+
+            _log(
+                "pi3/pi3x: running image-only inference "
+                f"for {view_names}, pixel_limit={pixel_limit}, confidence_threshold={confidence_threshold}, "
+                f"edge_filter={edge_filter}, edge_rtol={edge_rtol}."
+            )
+            _progress(progress_cb, 55, "Running pi3/pi3x inference")
+            _raise_if_cancelled(cancel_evt)
+            dtype_value = None
+            if self._device_label == "cuda" and self._dtype_label in {"bfloat16", "float16"}:
+                dtype_value = torch.bfloat16 if self._dtype_label == "bfloat16" else torch.float16
+            with torch.no_grad():
+                if self._device_label == "cuda" and dtype_value is not None:
+                    with torch.amp.autocast("cuda", dtype=dtype_value):
+                        result = self._model(imgs[None])
+                else:
+                    result = self._model(imgs[None])
+
+            _progress(progress_cb, 78, "Filtering pi3/pi3x point cloud")
+            _raise_if_cancelled(cancel_evt)
+            required_outputs = {"points", "local_points", "rays", "conf", "camera_poses", "metric"}
+            missing_outputs = sorted(required_outputs.difference(result))
+            if missing_outputs:
+                raise RuntimeError("pi3/pi3x inference omitted required outputs: " + ", ".join(missing_outputs))
+
+            for output_name in required_outputs:
+                _validate_finite_array(output_name, result[output_name], positive=output_name == "metric")
+
+            confidence_logits = result["conf"][0, ..., 0].float()
+            confidence = torch.sigmoid(confidence_logits)
+            valid_mask = confidence > confidence_threshold
+            if edge_filter:
+                edges = depth_normal_edge(result["local_points"][0], rtol=edge_rtol, mask=valid_mask)
+                valid_mask = torch.logical_and(valid_mask, ~edges)
+            _raise_if_cancelled(cancel_evt)
+            intrinsics = recover_intrinsic_from_rays_d(result["rays"][0].float())
+            colors_tensor = imgs.permute(0, 2, 3, 1).float()
+            points = result["points"][0][valid_mask]
+            colors = colors_tensor[valid_mask]
+            retained_points = int(points.shape[0])
+            _log(f"pi3/pi3x: retained {retained_points} points after filtering.")
+            if points.numel() == 0:
+                raise RuntimeError(
+                    "pi3/pi3x produced zero retained points. Lower confidence_threshold or disable edge_filter."
+                )
+
+            arrays = {
+                "points": np.asarray(_tensor_to_numpy(result["points"][0]), dtype=np.float32),
+                "local_points": np.asarray(_tensor_to_numpy(result["local_points"][0]), dtype=np.float32),
+                "rays": np.asarray(_tensor_to_numpy(result["rays"][0]), dtype=np.float32),
+                "depth": np.asarray(_tensor_to_numpy(result["local_points"][0, ..., 2]), dtype=np.float32),
+                "confidence_logits": np.asarray(_tensor_to_numpy(confidence_logits), dtype=np.float32),
+                "confidence": np.asarray(_tensor_to_numpy(confidence), dtype=np.float32),
+                "valid_mask": np.asarray(_tensor_to_numpy(valid_mask), dtype=bool),
+                "camera_poses": np.asarray(_tensor_to_numpy(result["camera_poses"][0]), dtype=np.float32),
+                "intrinsics": np.asarray(_tensor_to_numpy(intrinsics), dtype=np.float32),
+                "metric": np.asarray(_tensor_to_numpy(result["metric"][0]), dtype=np.float32),
+                "colors": np.asarray(_tensor_to_numpy(colors_tensor), dtype=np.float32),
+            }
+            _validate_pi3x_arrays(arrays)
+            reservation = _reserve_output_base(
+                self.outputs_dir,
+                output_base,
+                lambda base: _pi3x_bundle_names(base, view_names),
+            )
+            bundle_base = reservation.base_name
+            stage_dir.mkdir(parents=True, exist_ok=True)
+            stage_glb = stage_dir / f"{bundle_base}.glb"
+            stage_ply = stage_dir / f"{bundle_base}.ply"
+            points_cpu = points.detach().cpu()
+            colors_cpu = colors.detach().cpu()
+            _progress(progress_cb, 86, "Writing pi3/pi3x PLY")
+            _raise_if_cancelled(cancel_evt)
+            with contextlib.redirect_stdout(sys.stderr):
+                write_ply(points_cpu, colors_cpu, str(stage_ply))
+            _progress(progress_cb, 89, "Writing pi3/pi3x GLB preview")
+            _raise_if_cancelled(cancel_evt)
+            _write_point_cloud_glb(points_cpu, colors_cpu, stage_glb)
+
+            filenames = {
+                "glb": stage_glb.name,
+                "ply": stage_ply.name,
+                "npz": f"{bundle_base}_pi3x.npz",
+                "metadata": f"{bundle_base}_metadata.json",
+                "depth_previews": [f"{bundle_base}_depth_{name}.png" for name in view_names],
+                "confidence_previews": [f"{bundle_base}_confidence_{name}.png" for name in view_names],
+            }
+            metadata: dict[str, Any] = {
+                "extension_id": EXTENSION_ID,
+                "node_id": config.node_id,
+                "model_id": config.model_id,
+                "hf_repo": config.hf_repo,
+                "view_names": view_names,
+                "tensor_shapes": {key: list(value.shape) for key, value in arrays.items()},
+                "camera_poses": arrays["camera_poses"].tolist(),
+                "recovered_intrinsics": arrays["intrinsics"].tolist(),
+                "metric": {
+                    "value": float(np.asarray(arrays["metric"]).reshape(-1)[0]),
+                    "label": "approximate",
+                },
+                "confidence_threshold": confidence_threshold,
+                "edge_filter": edge_filter,
+                "edge_rtol": edge_rtol,
+                "pixel_limit": pixel_limit,
+                "retained_point_count": retained_points,
+                "filenames": filenames,
+            }
+            _write_pi3x_sidecars(
+                stage_dir,
+                bundle_base,
+                arrays=arrays,
+                metadata=metadata,
+                view_names=view_names,
+                cancel_evt=cancel_evt,
+                progress_cb=progress_cb,
+            )
+
+            _progress(progress_cb, 98, "Publishing pi3/pi3x bundle")
+            _raise_if_cancelled(cancel_evt)
+            expected_names = _pi3x_bundle_names(bundle_base, view_names)
+            missing_staged = [name for name in expected_names if not (stage_dir / name).is_file()]
+            if missing_staged:
+                raise RuntimeError("pi3/pi3x export bundle is incomplete: " + ", ".join(missing_staged))
+            for name in expected_names:
+                _raise_if_cancelled(cancel_evt)
+                destination = self.outputs_dir / name
+                os.replace(stage_dir / name, destination)
+                promoted.append(destination)
+
+            final_glb = self.outputs_dir / f"{bundle_base}.glb"
+            _progress(progress_cb, 100, "pi3/pi3x point cloud complete")
+            _log(f"pi3/pi3x: generation complete; returning {final_glb} with {len(promoted) - 1} sidecars.")
+            shutil.rmtree(run_dir, ignore_errors=True)
+            return final_glb
+        except Exception:
+            for path in promoted:
+                path.unlink(missing_ok=True)
+            shutil.rmtree(run_dir, ignore_errors=True)
+            raise
+        finally:
+            if reservation is not None:
+                reservation.release()

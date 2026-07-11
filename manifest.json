@@ -4,14 +4,16 @@
   "type": "model",
   "name": "Pi3 Point Cloud",
   "displayName": "Pi3 Point Cloud",
-  "version": "0.1.0",
-  "description": "Modly model extension for Pi3 single-image point-cloud generation. The node returns a Generate-viewer-compatible .glb point-cloud preview and preserves a raw .ply sidecar.",
+  "version": "0.2.0",
+  "description": "Modly model extension with independent Pi3 single-image and Pi3X one-to-four-view point-cloud generation nodes.",
   "source": "https://github.com/yyfz/Pi3",
   "author": "DrHepa",
   "license": {
     "wrapper": "MIT",
     "upstream_code": "BSD-3-Clause with additional Apache-2.0 and CC-BY-NC-SA-4.0 file notices",
-    "weights": "Hugging Face model card: BSD-2-Clause metadata; academic-use notice; contact authors for commercial use"
+    "weights": "CC-BY-NC-4.0; Pi3 and Pi3X model weights are strictly noncommercial; older Pi3 Hugging Face metadata may report BSD-2, but this extension follows the current upstream repository's explicit weight terms",
+    "upstream_pi3x_code": "BSD-3-Clause",
+    "pi3x_weights": "CC-BY-NC-4.0; strictly noncommercial"
   },
   "generator_class": "Pi3Generator",
   "weight_owner_id": "generate",
@@ -44,7 +46,7 @@
       "id": "image",
       "type": "image",
       "required": true,
-      "label": "Input Image"
+      "label": "Front Image"
     }
   ],
   "outputs": [
@@ -71,7 +73,20 @@
       "managed_by": "modly-ui",
       "default_download": false,
       "storage_gb": 3.8,
-      "license": "BSD-2-Clause model-card metadata; no standalone weights license"
+      "license": "CC-BY-NC-4.0; strictly noncommercial"
+    },
+    {
+      "id": "pi3x-weights",
+      "type": "hf_file",
+      "repo": "yyfz233/Pi3X",
+      "path": "model.safetensors",
+      "owner_id": "pi3x",
+      "target": "models/pi3/pi3x/model.safetensors",
+      "required": true,
+      "managed_by": "modly-ui",
+      "default_download": false,
+      "storage_gb": 5.44,
+      "license": "CC-BY-NC-4.0; strictly noncommercial"
     }
   ],
   "setup": {
@@ -86,7 +101,21 @@
       "managed_by": "modly-ui",
       "expected_relative_path": "models/pi3/generate/model.safetensors",
       "hf_repo": "yyfz233/Pi3",
-      "download_check": "model.safetensors"
+      "download_check": "model.safetensors",
+      "nodes": [
+        {
+          "node_id": "generate",
+          "hf_repo": "yyfz233/Pi3",
+          "expected_relative_path": "models/pi3/generate/model.safetensors",
+          "download_check": "model.safetensors"
+        },
+        {
+          "node_id": "pi3x",
+          "hf_repo": "yyfz233/Pi3X",
+          "expected_relative_path": "models/pi3/pi3x/model.safetensors",
+          "download_check": "model.safetensors"
+        }
+      ]
     },
     "evidence": {
       "status_path": ".modly/setup/setup-status.json",
@@ -116,6 +145,7 @@
       "hf_repo": "yyfz233/Pi3",
       "download_check": "model.safetensors",
       "weight_owner_id": "generate",
+      "license": "CC-BY-NC-4.0; strictly noncommercial",
       "hf_skip_prefixes": [
         ".gitattributes",
         "README.md",
@@ -227,6 +257,198 @@
           "type": "string",
           "default": "pi3_point_cloud",
           "tooltip": "Base filename for generated outputs. The extension returns <name>.glb for preview and also writes <name>.ply as a raw sidecar. Existing .ply or .glb suffixes are accepted."
+        }
+      ]
+    },
+    {
+      "id": "pi3x",
+      "type": "model.generate",
+      "name": "Pi3X Multi-View Point Cloud",
+      "displayName": "Pi3X Multi-View Point Cloud",
+      "capability_id": "image-to-point-cloud",
+      "description": "Generate a colored point cloud from one to four ordered RGB views using image-only Pi3X.",
+      "input": "image",
+      "output": "mesh",
+      "output_formats": [
+        "glb",
+        "ply"
+      ],
+      "pbr": false,
+      "hf_repo": "yyfz233/Pi3X",
+      "download_check": "model.safetensors",
+      "weight_owner_id": "pi3x",
+      "hf_skip_prefixes": [
+        ".gitattributes",
+        "README.md",
+        "readme.md",
+        "config.json",
+        "assets/",
+        "docs/",
+        "examples/",
+        "images/",
+        "figures/",
+        "media/"
+      ],
+      "storage_gb": 5.44,
+      "license": "CC-BY-NC-4.0; strictly noncommercial",
+      "vram_gb": 12,
+      "recommended_vram_gb": 16,
+      "params_schema": [
+        {
+          "id": "pixel_limit",
+          "label": "Pixel Limit",
+          "type": "int",
+          "default": 255000,
+          "min": 196,
+          "max": 1200000,
+          "tooltip": "Maximum resized image pixels before Pi3 inference. Higher preserves detail but increases VRAM and time. Dimensions are rounded to multiples of 14."
+        },
+        {
+          "id": "confidence_threshold",
+          "label": "Confidence Threshold",
+          "type": "float",
+          "default": 0.1,
+          "min": 0.0,
+          "max": 1.0,
+          "step": 0.01,
+          "tooltip": "Minimum sigmoid confidence used to keep points. Higher removes uncertain points; too high can produce an empty point cloud."
+        },
+        {
+          "id": "edge_rtol",
+          "label": "Edge Relative Tolerance",
+          "type": "float",
+          "default": 0.03,
+          "min": 0.0,
+          "max": 0.25,
+          "step": 0.005,
+          "tooltip": "Relative depth-jump tolerance for Pi3 edge filtering. Lower removes more edge points."
+        },
+        {
+          "id": "edge_filter",
+          "label": "Edge Filter",
+          "type": "select",
+          "default": "true",
+          "options": [
+            {
+              "value": "true",
+              "label": "Enabled"
+            },
+            {
+              "value": "false",
+              "label": "Disabled"
+            }
+          ],
+          "tooltip": "Apply Pi3 depth/normal edge filtering before writing the point cloud."
+        },
+        {
+          "id": "left_image_path",
+          "label": "Left View Image",
+          "type": "string",
+          "default": "",
+          "pickerIntent": "image",
+          "filters": [
+            {
+              "name": "Images",
+              "extensions": [
+                "png",
+                "jpg",
+                "jpeg",
+                "webp"
+              ]
+            }
+          ],
+          "tooltip": "Optional left-side view image path inside WORKSPACE_DIR."
+        },
+        {
+          "id": "back_image_path",
+          "label": "Back View Image",
+          "type": "string",
+          "default": "",
+          "pickerIntent": "image",
+          "filters": [
+            {
+              "name": "Images",
+              "extensions": [
+                "png",
+                "jpg",
+                "jpeg",
+                "webp"
+              ]
+            }
+          ],
+          "tooltip": "Optional back view image path inside WORKSPACE_DIR."
+        },
+        {
+          "id": "right_image_path",
+          "label": "Right View Image",
+          "type": "string",
+          "default": "",
+          "pickerIntent": "image",
+          "filters": [
+            {
+              "name": "Images",
+              "extensions": [
+                "png",
+                "jpg",
+                "jpeg",
+                "webp"
+              ]
+            }
+          ],
+          "tooltip": "Optional right-side view image path inside WORKSPACE_DIR."
+        },
+        {
+          "id": "torch_dtype",
+          "label": "Torch DType",
+          "type": "select",
+          "default": "auto",
+          "options": [
+            {
+              "value": "auto",
+              "label": "Auto"
+            },
+            {
+              "value": "bfloat16",
+              "label": "bfloat16"
+            },
+            {
+              "value": "float16",
+              "label": "float16"
+            },
+            {
+              "value": "float32",
+              "label": "float32"
+            }
+          ],
+          "tooltip": "CUDA autocast dtype. Auto uses bfloat16 on Ampere+ GPUs and float16 on older CUDA GPUs. CPU uses float32."
+        },
+        {
+          "id": "device",
+          "label": "Device",
+          "type": "select",
+          "default": "auto",
+          "options": [
+            {
+              "value": "auto",
+              "label": "Auto"
+            },
+            {
+              "value": "cuda",
+              "label": "CUDA"
+            },
+            {
+              "value": "cpu",
+              "label": "CPU (slow)"
+            }
+          ],
+          "tooltip": "Auto uses CUDA when available. CPU is allowed but can be extremely slow and memory-heavy."
+        },
+        {
+          "id": "output_name",
+          "label": "Output Name",
+          "type": "string",
+          "default": "pi3x_point_cloud",
+          "tooltip": "Base filename shared by the Pi3X GLB/PLY bundle and its documented NPZ, JSON, depth, and confidence sidecars."
         }
       ]
     }
