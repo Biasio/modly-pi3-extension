@@ -9,7 +9,7 @@ Both nodes return a GLB artifact containing glTF `POINTS` for the Modly viewer a
 
 ## Model weights
 
-`setup.py` prepares shared dependencies and FlashAttention, but never downloads weights. Use Modly's Models UI to download each node independently:
+`setup.py` prepares required shared dependencies and prefers FlashAttention acceleration, but never downloads weights. Use Modly's Models UI to download each node independently:
 
 | Node | Hugging Face repository | Runtime path | Storage |
 | --- | --- | --- | --- |
@@ -83,11 +83,17 @@ python setup.py --python-exe /path/to/runtime/python --ext-dir /path/to/installe
 
 Setup writes `.modly/setup/setup-status.json`. For backward compatibility, its top-level `status` and `weights_present` fields describe the existing `pi3/generate` node: missing dependencies produce `needs_dependencies`, and missing Pi3 weights produce `needs_weights`. A missing Pi3X checkpoint does not downgrade a ready Pi3 setup. The `nodes.generate` and `nodes.pi3x` diagnostics report each checkpoint independently, and runtime readiness remains live and node-specific. Missing weights remain a successful setup exit because the UI owns downloads.
 
-The primary CUDA path uses local/source-built `flash-attn` for fp16/bf16 no-mask attention, with PyTorch SDPA as runtime fallback. A reusable wheel can be prepared in `.pi3-runtime/wheelhouse/flash-attn/`:
+FlashAttention (`flash_attn`) is optional but preferred for fp16/bf16 no-mask CUDA attention. Normal setup keeps the existing priority: use an importable package, try an extension-local wheel when present, otherwise try a binary wheel, and compile from source only when the setup flag, environment, or Blackwell/GB10 policy already allows it.
+
+If FlashAttention is unavailable, a wheel is incompatible, build tooling or source compilation fails, or the post-install import probe fails, setup records the nonfatal `flash_attn_status` value `fallback-sdpa` together with the original diagnostic code, error, probe, and pip result details. It emits an `OPTIONAL acceleration failure` warning and continues with PyTorch SDPA. Generation can still run when the required dependencies and CUDA smoke probe pass, but it may be slower and use more VRAM; the FlashAttention warning does not itself mean generation failed.
+
+A reusable wheel can be prepared in `.pi3-runtime/wheelhouse/flash-attn/`:
 
 ```bash
 python3 setup.py --build-flash-attn-wheel --max-build-jobs 2 '{"python_exe":"/path/to/python","ext_dir":"/path/to/Modly/extensions/pi3","gpu_sm":121,"cuda_version":128}'
 ```
+
+This dedicated `--build-flash-attn-wheel` mode is explicit: if its requested wheel build fails, setup returns nonzero rather than falling back. Required dependency failures and a failed CUDA smoke probe also remain fatal in normal setup.
 
 ## Parameters
 

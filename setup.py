@@ -65,6 +65,12 @@ FLASH_ATTN_BUILD_REQUIREMENTS = ["packaging", "ninja", "psutil"]
 FLASH_ATTN_WHEELHOUSE_RELATIVE_PATH = Path(".pi3-runtime") / "wheelhouse" / "flash-attn"
 ALLOW_FLASH_ATTN_SOURCE_BUILD_ENV = "MODLY_PI3_ALLOW_FLASH_ATTN_SOURCE_BUILD"
 MAX_BUILD_JOBS_ENV = "MODLY_PI3_MAX_BUILD_JOBS"
+FLASH_ATTN_FALLBACK_STATUS = "fallback-sdpa"
+FLASH_ATTN_FALLBACK_BACKEND = "pytorch-sdpa"
+FLASH_ATTN_FALLBACK_WARNING = (
+    "OPTIONAL acceleration failure: FlashAttention is unavailable; setup is continuing with PyTorch SDPA. "
+    "Generation may be slower and use more VRAM."
+)
 
 DEPENDENCY_IMPORTS: list[tuple[str, str]] = [
     ("torch", "torch"),
@@ -692,6 +698,32 @@ def flash_attn_is_available(probe: dict[str, Any]) -> bool:
     return probe.get("flash_attn", {}).get("status") == "ok"
 
 
+def mark_flash_attn_fallback(
+    summary: dict[str, Any],
+    *,
+    code: str,
+    error: str,
+    mode: str | None = None,
+) -> dict[str, Any]:
+    previous_status = summary.get("status")
+    if previous_status and previous_status != "pending":
+        summary.setdefault("status_before_fallback", previous_status)
+    if mode is not None:
+        summary["mode"] = mode
+    summary.update(
+        {
+            "status": FLASH_ATTN_FALLBACK_STATUS,
+            "optional": True,
+            "preferred_acceleration": FLASH_ATTN_PACKAGE,
+            "fallback_backend": FLASH_ATTN_FALLBACK_BACKEND,
+            "failure_status": "failed",
+            "code": code,
+            "error": error,
+        }
+    )
+    return summary
+
+
 def max_build_jobs(config: SetupConfig) -> int | None:
     return config.max_build_jobs or parse_int(os.environ.get(MAX_BUILD_JOBS_ENV))
 
@@ -809,6 +841,19 @@ def ensure_flash_attn_installed(
         "results": [],
     }
 
+    def run_pip_attempt(
+        mode: str,
+        args: list[str],
+        *,
+        env: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        # Completed pip commands report expected acquisition/build failures via
+        # a nonzero result. Exceptions mean setup or pip infrastructure itself
+        # failed and must propagate to the fatal outer setup handler.
+        result = pip_command(python_exe, log_path, args, env=env)
+        summary["results"].append({"mode": mode, "result": result})
+        return result
+
     if not summary["cuda_expected"]:
         summary.update({"status": "skipped", "mode": "cuda-not-expected"})
         return summary
@@ -824,9 +869,8 @@ def ensure_flash_attn_installed(
     if wheels:
         summary["attempted"] = True
         summary["mode"] = "local-wheelhouse"
-        wheelhouse_result = pip_command(
-            python_exe,
-            log_path,
+        wheelhouse_result = run_pip_attempt(
+            "local-wheelhouse",
             [
                 "install",
                 "--force-reinstall",
@@ -837,77 +881,71 @@ def ensure_flash_attn_installed(
                 FLASH_ATTN_PACKAGE,
             ],
         )
-        summary["results"].append({"mode": "local-wheelhouse", "result": wheelhouse_result})
         if wheelhouse_result["ok"]:
             summary["status"] = "installed"
             return summary
-        summary.update(
-            {
-                "status": "failed",
-                "error": "A local flash-attn wheel was found but pip could not install it. Remove the bad wheel or rebuild it with --build-flash-attn-wheel.",
-                "code": "flash-attn-local-wheel-install-failed",
-            }
+        return mark_flash_attn_fallback(
+            summary,
+            code="flash-attn-local-wheel-install-failed",
+            error=(
+                "A local flash-attn wheel was found but pip could not install it. "
+                "Remove the incompatible wheel or rebuild it with --build-flash-attn-wheel."
+            ),
         )
-        return summary
 
     summary["attempted"] = True
-    binary_result = pip_command(
-        python_exe,
-        log_path,
+    binary_result = run_pip_attempt(
+        "binary-wheel",
         ["install", *PIP_FLAGS, "--only-binary", ":all:", FLASH_ATTN_PACKAGE],
     )
-    summary["results"].append({"mode": "binary-wheel", "result": binary_result})
     if binary_result["ok"]:
         summary.update({"status": "installed", "mode": "binary-wheel"})
         return summary
 
     if not allow_source["allowed"]:
-        summary.update(
-            {
-                "status": "failed",
-                "mode": "wheel-required",
-                "code": "flash-attn-wheel-unavailable",
-                "error": (
-                    "No compatible flash-attn wheel was available. Build a local wheel with "
-                    "`python3 setup.py --build-flash-attn-wheel --max-build-jobs 2 ...` and rerun setup, "
-                    "or explicitly pass --allow-flash-attn-source-build if a long source build is acceptable."
-                ),
-            }
+        return mark_flash_attn_fallback(
+            summary,
+            mode="wheel-required",
+            code="flash-attn-wheel-unavailable",
+            error=(
+                "No compatible flash-attn wheel was available. Build a local wheel with "
+                "`python3 setup.py --build-flash-attn-wheel --max-build-jobs 2 ...` and rerun setup, "
+                "or explicitly pass --allow-flash-attn-source-build if a long source build is acceptable."
+            ),
         )
-        return summary
 
     build_env = cuda_build_env(cuda_version, gpu_sm=config.gpu_sm, max_jobs=max_jobs)
-    build_tools_result = pip_command(
-        python_exe,
-        log_path,
+    build_tools_result = run_pip_attempt(
+        "source-build-tools",
         ["install", *PIP_FLAGS, "--upgrade", "pip", "setuptools", "wheel", *FLASH_ATTN_BUILD_REQUIREMENTS],
         env=build_env or None,
     )
-    summary["results"].append({"mode": "source-build-tools", "result": build_tools_result})
     if not build_tools_result["ok"]:
-        summary.update({"status": "failed", "mode": "source-build", "code": "flash-attn-build-tools-failed", "error": "Could not install flash-attn source-build prerequisites."})
-        return summary
+        return mark_flash_attn_fallback(
+            summary,
+            mode="source-build",
+            code="flash-attn-build-tools-failed",
+            error="Could not install flash-attn source-build prerequisites.",
+        )
 
-    source_result = pip_command(
-        python_exe,
-        log_path,
+    source_result = run_pip_attempt(
+        "source-build",
         ["install", *PIP_FLAGS, FLASH_ATTN_PACKAGE, "--no-build-isolation"],
         env=build_env or None,
     )
-    summary["results"].append({"mode": "source-build", "result": source_result})
     if source_result["ok"]:
         summary.update({"status": "installed", "mode": "source-build"})
         return summary
 
-    summary.update(
-        {
-            "status": "failed",
-            "mode": "source-build",
-            "code": "flash-attn-source-build-failed",
-            "error": "flash-attn source build failed. Build a local wheel in a prepared CUDA 12.8 environment or inspect the setup log for compiler errors.",
-        }
+    return mark_flash_attn_fallback(
+        summary,
+        mode="source-build",
+        code="flash-attn-source-build-failed",
+        error=(
+            "flash-attn source build failed. Build a local wheel in a prepared CUDA 12.8 environment "
+            "or inspect the setup log for compiler errors."
+        ),
     )
-    return summary
 
 
 def build_flash_attn_wheel(config: SetupConfig, log_path: Path, torch_plan: dict[str, Any]) -> int:
@@ -1023,6 +1061,7 @@ def write_status(config: SetupConfig, status: str, details: dict[str, Any]) -> P
         "weights_managed_by": "modly-ui",
         "default_downloads": False,
         "nodes": node_diagnostics,
+        "dependencies_ok": details.get("dependencies_ok"),
         "torch_install_lane": details.get("torch_install", {}).get("lane"),
         "torch_install_index_url": details.get("torch_install", {}).get("index_url"),
         "torch_packages": details.get("torch_install", {}).get("packages"),
@@ -1031,6 +1070,9 @@ def write_status(config: SetupConfig, status: str, details: dict[str, Any]) -> P
         "torch_cuda_smoke_error": details.get("torch_install", {}).get("cuda_smoke_error"),
         "flash_attn_status": details.get("flash_attn", {}).get("status"),
         "flash_attn_mode": details.get("flash_attn", {}).get("mode"),
+        "flash_attn_code": details.get("flash_attn", {}).get("code"),
+        "flash_attn_error": details.get("flash_attn", {}).get("error"),
+        "flash_attn_results": details.get("flash_attn", {}).get("results", []),
         "flash_attn_wheelhouse": details.get("flash_attn", {}).get("wheelhouse"),
         "flash_attn_probe": details.get("flash_attn", {}).get("probe_after") or details.get("flash_attn", {}).get("probe_before"),
         "details": details,
@@ -1192,19 +1234,19 @@ def main(argv: list[str]) -> int:
         )
         if details["flash_attn"].get("attempted"):
             details["install_attempted"] = True
-        if details["flash_attn"].get("status") == "failed":
-            status_path = write_status(config, "needs_dependencies", details)
-            log(f"Setup failed: {details['flash_attn'].get('error')}", stream=sys.stderr)
-            log(f"Status written to {status_path}")
-            return 1
 
-        if not missing_before and not torch_reasons and details["flash_attn"].get("status") in {"ok", "skipped"}:
-            log("Runtime dependency imports already available.")
+        if not missing_before and not torch_reasons and details["flash_attn"].get("status") in {
+            "ok",
+            "skipped",
+            FLASH_ATTN_FALLBACK_STATUS,
+        }:
+            log("Required runtime dependency imports already available.")
 
         probe_after = run_python_probe(runtime_python)
         missing_after = missing_dependencies(probe_after)
         details["probe_after"] = probe_after
         details["missing_dependencies_after"] = missing_after
+        details["dependencies_ok"] = not missing_after
         details["torch_install"]["cuda_available_after"] = probe_after.get("torch", {}).get("cuda_available")
         details["torch_install"]["torch_version_after"] = probe_after.get("torch", {}).get("version")
         details["torch_install"]["torch_cuda_version_after"] = probe_after.get("torch", {}).get("cuda_version")
@@ -1214,14 +1256,33 @@ def main(argv: list[str]) -> int:
         details["flash_attn"]["missing_after"] = flash_attn_missing_after
 
         if flash_attn_missing_after:
-            details["notes"].append(
-                "CUDA is expected, but the flash_attn package is missing or failed to import. PyTorch SDPA fallback exists, but package FlashAttention is the primary public-extension acceleration path."
+            flash_probe = details["flash_attn"]["probe_after"]
+            if details["flash_attn"].get("status") != FLASH_ATTN_FALLBACK_STATUS:
+                probe_status = str(flash_probe.get("status") or "missing")
+                probe_error = flash_probe.get("error")
+                failure_code = (
+                    "flash-attn-post-install-import-failed"
+                    if probe_status == "error"
+                    else "flash-attn-post-install-missing"
+                )
+                failure_error = (
+                    f"flash_attn failed its post-install import probe: {probe_error}"
+                    if probe_error
+                    else "flash_attn was unavailable after the preferred installation attempts."
+                )
+                mark_flash_attn_fallback(
+                    details["flash_attn"],
+                    code=failure_code,
+                    error=failure_error,
+                )
+            warning = (
+                f"{FLASH_ATTN_FALLBACK_WARNING} To restore the preferred acceleration path, inspect {log_path} "
+                "and install or build a compatible flash-attn wheel. "
+                f"Diagnostic code: {details['flash_attn'].get('code', 'flash-attn-unavailable')}."
             )
-            if not (config.validate_only or config.no_install):
-                status_path = write_status(config, "needs_dependencies", details)
-                log("Setup failed: flash_attn package is unavailable after setup.", stream=sys.stderr)
-                log(f"Status written to {status_path}")
-                return 1
+            details["notes"].append(warning)
+            append_log(log_path, warning)
+            log(warning, stream=sys.stderr)
 
         if missing_after and not (config.validate_only or config.no_install):
             status_path = write_status(config, "needs_dependencies", details)
@@ -1240,6 +1301,7 @@ def main(argv: list[str]) -> int:
             cuda_smoke_failed = not details["torch_install"]["cuda_smoke_ok"]
 
         if cuda_smoke_failed:
+            details["dependencies_ok"] = False
             details["notes"].append(
                 "CUDA was expected, but a tiny CUDA tensor smoke probe failed after dependency setup."
             )
@@ -1252,7 +1314,7 @@ def main(argv: list[str]) -> int:
         details["node_weights"] = weight_diagnostics
         missing_weight_nodes = [node_id for node_id, item in weight_diagnostics.items() if not item["weights_present"]]
         overall_status = overall_setup_status(
-            dependencies_ok=not missing_after and not flash_attn_missing_after,
+            dependencies_ok=bool(details["dependencies_ok"]),
             node_diagnostics=weight_diagnostics,
         )
         if missing_weight_nodes:

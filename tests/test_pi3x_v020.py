@@ -21,6 +21,170 @@ except ImportError:  # pragma: no cover
 ROOT = Path(__file__).resolve().parents[1]
 
 
+class FlashAttentionOptionalFallbackTests(unittest.TestCase):
+    @staticmethod
+    def _probe(*, missing=(), flash_status="missing", flash_error=None):
+        imports = {
+            package: package not in set(missing)
+            for package, _module in setup.DEPENDENCY_IMPORTS
+        }
+        flash = {"status": flash_status}
+        if flash_error:
+            flash["error"] = flash_error
+        return {
+            "python": "/fake/venv/python",
+            "imports": imports,
+            "torch": {
+                "version": "2.7.0+cu128",
+                "cuda_version": "12.8",
+                "cuda_available": True,
+            },
+            "torchvision": {"version": "0.22.0+cu128"},
+            "flash_attn": flash,
+        }
+
+    @staticmethod
+    def _pip_result(ok, tail):
+        return {
+            "command": ["/fake/venv/python", "-m", "pip"],
+            "returncode": 0 if ok else 1,
+            "ok": ok,
+            "stdout_tail": tail,
+            "env": {},
+        }
+
+    @staticmethod
+    def _payload(ext, **extra):
+        payload = {
+            "python_exe": "/provided/python",
+            "ext_dir": str(ext),
+            "gpu_sm": 121,
+            "cuda_version": 128,
+            "allow_flash_attn_source_build": True,
+        }
+        payload.update(extra)
+        return json.dumps(payload)
+
+    def test_normal_setup_source_build_failure_uses_sdpa_and_preserves_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temp:
+            ext = Path(temp) / "pi3"
+            probe = self._probe()
+            stderr = io.StringIO()
+            pip_results = [
+                self._pip_result(False, "no compatible binary wheel"),
+                self._pip_result(True, "build tools ready"),
+                self._pip_result(False, "nvcc compilation failed"),
+            ]
+            with mock.patch.object(setup, "ensure_extension_venv", return_value=ext / "venv/bin/python"), mock.patch.object(
+                setup, "run_python_probe", return_value=probe
+            ), mock.patch.object(setup, "pip_command", side_effect=pip_results), mock.patch.object(
+                setup,
+                "run_cuda_smoke_probe",
+                return_value={"cuda_available": True, "smoke_ok": True, "smoke_error": None},
+            ), mock.patch.object(setup.sys, "stderr", stderr):
+                returncode = setup.main([self._payload(ext)])
+
+            payload = json.loads((ext / setup.STATUS_RELATIVE_PATH).read_text())
+            self.assertEqual(returncode, 0)
+            self.assertEqual(payload["status"], "needs_weights")
+            self.assertTrue(payload["dependencies_ok"])
+            self.assertEqual(payload["flash_attn_status"], "fallback-sdpa")
+            self.assertEqual(payload["flash_attn_code"], "flash-attn-source-build-failed")
+            self.assertEqual(payload["flash_attn_results"][-1]["result"]["stdout_tail"], "nvcc compilation failed")
+            self.assertEqual(payload["details"]["flash_attn"]["fallback_backend"], "pytorch-sdpa")
+            warning = stderr.getvalue()
+            self.assertIn("OPTIONAL acceleration failure", warning)
+            self.assertIn("continuing with PyTorch SDPA", warning)
+            self.assertIn("slower", warning)
+            self.assertIn("more VRAM", warning)
+
+    def test_post_install_import_failure_is_nonfatal_and_keeps_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            ext = Path(temp) / "pi3"
+            before = self._probe()
+            after = self._probe(
+                flash_status="error",
+                flash_error="ImportError: undefined symbol: flash_attn_cuda",
+            )
+            with mock.patch.object(setup, "ensure_extension_venv", return_value=ext / "venv/bin/python"), mock.patch.object(
+                setup, "run_python_probe", side_effect=[before, before, after]
+            ), mock.patch.object(
+                setup, "pip_command", return_value=self._pip_result(True, "binary wheel installed")
+            ), mock.patch.object(
+                setup,
+                "run_cuda_smoke_probe",
+                return_value={"cuda_available": True, "smoke_ok": True, "smoke_error": None},
+            ), mock.patch.object(setup.sys, "stderr", io.StringIO()):
+                returncode = setup.main([self._payload(ext)])
+
+            payload = json.loads((ext / setup.STATUS_RELATIVE_PATH).read_text())
+            self.assertEqual(returncode, 0)
+            self.assertEqual(payload["flash_attn_status"], "fallback-sdpa")
+            self.assertEqual(payload["flash_attn_code"], "flash-attn-post-install-import-failed")
+            self.assertIn("undefined symbol", payload["flash_attn_error"])
+            self.assertEqual(payload["details"]["flash_attn"]["status_before_fallback"], "installed")
+
+    def test_missing_required_dependency_remains_fatal(self):
+        with tempfile.TemporaryDirectory() as temp:
+            ext = Path(temp) / "pi3"
+            probe = self._probe(missing={"numpy"}, flash_status="ok")
+            smoke = mock.Mock()
+            with mock.patch.object(setup, "ensure_extension_venv", return_value=ext / "venv/bin/python"), mock.patch.object(
+                setup, "run_python_probe", return_value=probe
+            ), mock.patch.object(setup, "install_base_requirements"), mock.patch.object(
+                setup, "pip_command", side_effect=AssertionError("unexpected pip call")
+            ), mock.patch.object(setup, "run_cuda_smoke_probe", smoke), mock.patch.object(
+                setup.sys, "stderr", io.StringIO()
+            ):
+                returncode = setup.main([self._payload(ext)])
+
+            payload = json.loads((ext / setup.STATUS_RELATIVE_PATH).read_text())
+            self.assertEqual(returncode, 1)
+            self.assertEqual(payload["status"], "needs_dependencies")
+            self.assertFalse(payload["dependencies_ok"])
+            smoke.assert_not_called()
+
+    def test_failed_cuda_smoke_remains_fatal(self):
+        with tempfile.TemporaryDirectory() as temp:
+            ext = Path(temp) / "pi3"
+            probe = self._probe(flash_status="ok")
+            with mock.patch.object(setup, "ensure_extension_venv", return_value=ext / "venv/bin/python"), mock.patch.object(
+                setup, "run_python_probe", return_value=probe
+            ), mock.patch.object(
+                setup, "pip_command", side_effect=AssertionError("unexpected pip call")
+            ), mock.patch.object(
+                setup,
+                "run_cuda_smoke_probe",
+                return_value={"cuda_available": True, "smoke_ok": False, "smoke_error": "CUDA launch failed"},
+            ), mock.patch.object(setup.sys, "stderr", io.StringIO()):
+                returncode = setup.main([self._payload(ext)])
+
+            payload = json.loads((ext / setup.STATUS_RELATIVE_PATH).read_text())
+            self.assertEqual(returncode, 1)
+            self.assertEqual(payload["status"], "needs_dependencies")
+            self.assertFalse(payload["dependencies_ok"])
+            self.assertEqual(payload["torch_cuda_smoke_error"], "CUDA launch failed")
+
+    def test_explicit_flash_attention_wheel_build_failure_remains_fatal(self):
+        with tempfile.TemporaryDirectory() as temp:
+            ext = Path(temp) / "pi3"
+            probe = self._probe()
+            with mock.patch.object(setup, "ensure_extension_venv", return_value=ext / "venv/bin/python"), mock.patch.object(
+                setup, "run_python_probe", return_value=probe
+            ), mock.patch.object(
+                setup, "pip_command", return_value=self._pip_result(False, "build tools failed")
+            ), mock.patch.object(setup.sys, "stderr", io.StringIO()):
+                returncode = setup.main(
+                    ["--build-flash-attn-wheel", self._payload(ext)]
+                )
+
+            payload = json.loads((ext / setup.STATUS_RELATIVE_PATH).read_text())
+            self.assertEqual(returncode, 1)
+            self.assertEqual(payload["status"], "failed")
+            self.assertEqual(payload["flash_attn_status"], "failed")
+            self.assertEqual(payload["flash_attn_code"], "flash-attn-build-tools-failed")
+
+
 class Pi3RuntimeParamsSchemaTests(unittest.TestCase):
     @staticmethod
     def _schema_by_id():
@@ -109,7 +273,7 @@ class Pi3RuntimeParamsSchemaTests(unittest.TestCase):
 
 
 @unittest.skipIf(np is None or Image is None, "NumPy and Pillow are required for sidecar tests")
-class Pi3ExtensionV021Tests(unittest.TestCase):
+class Pi3ExtensionV022Tests(unittest.TestCase):
     def _image_bytes(self, color=(20, 40, 60)):
         stream = io.BytesIO()
         Image.new("RGB", (8, 6), color).save(stream, format="PNG")
@@ -122,7 +286,7 @@ class Pi3ExtensionV021Tests(unittest.TestCase):
 
     def test_manifest_separates_canonical_pi3_and_pi3x(self):
         manifest = json.loads((ROOT / "manifest.json").read_text())
-        self.assertEqual(manifest["version"], "0.2.1")
+        self.assertEqual(manifest["version"], "0.2.2")
         nodes = {node["id"]: node for node in manifest["nodes"]}
         self.assertEqual(set(nodes), {"generate", "pi3x"})
         self.assertEqual(nodes["generate"]["weight_owner_id"], "generate")

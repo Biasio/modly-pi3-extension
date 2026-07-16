@@ -4,7 +4,7 @@
   "type": "model",
   "name": "Pi3 Point Cloud",
   "displayName": "Pi3 Point Cloud",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Modly model extension with independent Pi3 single-image and Pi3X one-to-four-view point-cloud generation nodes.",
   "source": "https://github.com/yyfz/Pi3",
   "author": "DrHepa",
