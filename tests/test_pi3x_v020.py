@@ -273,7 +273,7 @@ class Pi3RuntimeParamsSchemaTests(unittest.TestCase):
 
 
 @unittest.skipIf(np is None or Image is None, "NumPy and Pillow are required for sidecar tests")
-class Pi3ExtensionV022Tests(unittest.TestCase):
+class Pi3ExtensionV023Tests(unittest.TestCase):
     def _image_bytes(self, color=(20, 40, 60)):
         stream = io.BytesIO()
         Image.new("RGB", (8, 6), color).save(stream, format="PNG")
@@ -286,16 +286,24 @@ class Pi3ExtensionV022Tests(unittest.TestCase):
 
     def test_manifest_separates_canonical_pi3_and_pi3x(self):
         manifest = json.loads((ROOT / "manifest.json").read_text())
-        self.assertEqual(manifest["version"], "0.2.2")
+        self.assertEqual(manifest["version"], "0.2.3")
         nodes = {node["id"]: node for node in manifest["nodes"]}
         self.assertEqual(set(nodes), {"generate", "pi3x"})
+        self.assertEqual(nodes["generate"]["input"], "image")
+        self.assertNotIn("io_contract", nodes["generate"])
+        self.assertNotIn("input_ports", nodes["generate"])
         self.assertEqual(nodes["generate"]["weight_owner_id"], "generate")
         self.assertEqual(nodes["generate"]["hf_repo"], "yyfz233/Pi3")
+        self.assertEqual(nodes["generate"]["download_check"], "model.safetensors")
         self.assertEqual(nodes["pi3x"]["weight_owner_id"], "pi3x")
         self.assertEqual(nodes["pi3x"]["hf_repo"], "yyfz233/Pi3X")
+        self.assertEqual(nodes["pi3x"]["download_check"], "model.safetensors")
         self.assertEqual(nodes["pi3x"]["input"], "image")
+        self.assertEqual(nodes["pi3x"]["output"], "mesh")
+        self.assertEqual(nodes["pi3x"]["io_contract"], "named-v1")
+        self.assertNotIn("inputs", nodes["pi3x"])
         self.assertEqual(
-            nodes["pi3x"]["inputs"],
+            nodes["pi3x"]["input_ports"],
             [
                 {"name": "front", "label": "Front RGB Image", "type": "image", "required": True},
                 {"name": "left", "label": "Left RGB Image", "type": "image", "required": False},
@@ -303,7 +311,15 @@ class Pi3ExtensionV022Tests(unittest.TestCase):
                 {"name": "right", "label": "Right RGB Image", "type": "image", "required": False},
             ],
         )
+        self.assertTrue(
+            all(
+                set(port) == {"name", "type", "label", "required"}
+                for port in nodes["pi3x"]["input_ports"]
+            )
+        )
         assets = {asset["id"]: asset for asset in manifest["asset_requirements"]}
+        self.assertEqual(assets["pi3-weights"]["repo"], "yyfz233/Pi3")
+        self.assertEqual(assets["pi3x-weights"]["repo"], "yyfz233/Pi3X")
         self.assertEqual(assets["pi3-weights"]["target"], "models/pi3/generate/model.safetensors")
         self.assertEqual(assets["pi3x-weights"]["target"], "models/pi3/pi3x/model.safetensors")
         self.assertEqual(assets["pi3x-weights"]["storage_gb"], 5.44)
@@ -468,6 +484,124 @@ class Pi3ExtensionV022Tests(unittest.TestCase):
                     setup.overall_setup_status(dependencies_ok=True, node_diagnostics=diagnostics),
                     "ready" if owner_id == "generate" else "needs_weights",
                 )
+
+    def test_named_views_canonicalize_real_png_bytes_in_port_order(self):
+        with tempfile.TemporaryDirectory() as temp:
+            input_dir = Path(temp) / "input"
+            names = generator._prepare_pi3x_named_views(
+                {
+                    "right": self._image_bytes((90, 80, 70)),
+                    "front": self._image_bytes((10, 20, 30)),
+                    "back": self._image_bytes((60, 50, 40)),
+                    "left": self._image_bytes((30, 40, 50)),
+                },
+                input_dir,
+            )
+
+            self.assertEqual(names, ["front", "left", "back", "right"])
+            self.assertEqual(
+                [path.name for path in sorted(input_dir.iterdir())],
+                ["back.png", "front.png", "left.png", "right.png"],
+            )
+            for view_name in names:
+                with Image.open(input_dir / f"{view_name}.png") as image:
+                    self.assertEqual(image.format, "PNG")
+                    self.assertEqual(image.mode, "RGB")
+                    self.assertEqual(image.size, (8, 6))
+
+            loaded_names = []
+
+            def fake_loader(path, **_kwargs):
+                loaded_names.extend(item.name for item in sorted(Path(path).iterdir()))
+                return object()
+
+            generator._load_prepared_views(
+                fake_loader,
+                input_dir,
+                names,
+                pixel_limit=255000,
+            )
+            self.assertEqual(
+                loaded_names,
+                ["00_front.png", "01_left.png", "02_back.png", "03_right.png"],
+            )
+
+    def test_named_views_reject_invalid_payloads(self):
+        with tempfile.TemporaryDirectory() as temp:
+            input_dir = Path(temp) / "input"
+            with self.assertRaisesRegex(ValueError, "front image"):
+                generator._prepare_pi3x_named_views({}, input_dir)
+            with self.assertRaisesRegex(ValueError, "front image"):
+                generator._prepare_pi3x_named_views({"front": b""}, input_dir)
+            with self.assertRaisesRegex(ValueError, "unknown image ports"):
+                generator._prepare_pi3x_named_views(
+                    {"front": self._image_bytes(), "top": self._image_bytes()},
+                    input_dir,
+                )
+            with self.assertRaisesRegex(TypeError, "must be bytes"):
+                generator._prepare_pi3x_named_views(
+                    {"front": self._image_bytes(), "left": "not-bytes"},
+                    input_dir,
+                )
+
+    def test_generate_v2_rejects_pi3_and_delegates_pi3x_prepared_views(self):
+        with tempfile.TemporaryDirectory() as temp:
+            outputs = Path(temp) / "Workflows"
+            gen = generator.Pi3Generator(outputs_dir=outputs)
+            with self.assertRaisesRegex(ValueError, "only for pi3/pi3x"):
+                gen.generate_v2({"front": self._image_bytes()}, {})
+            self.assertFalse(outputs.exists())
+
+            gen.node_id = "pi3x"
+            sentinel = outputs / "sentinel.glb"
+            captured = {}
+
+            def fake_core(run, view_names, params, progress_cb, cancel_evt):
+                captured["view_names"] = list(view_names)
+                captured["params"] = params
+                captured["files"] = {
+                    path.relative_to(run.staging_dir).as_posix()
+                    for path in run.staging_dir.rglob("*")
+                    if path.is_file()
+                }
+                return sentinel
+
+            with mock.patch.object(gen, "_generate_pi3x_in_run_dir", side_effect=fake_core) as core, mock.patch.object(
+                gen, "load", side_effect=AssertionError("generate_v2 should not load before shared core")
+            ) as load:
+                result = gen.generate_v2(
+                    {
+                        "right": self._image_bytes((3, 3, 3)),
+                        "front": self._image_bytes((1, 1, 1)),
+                        "left": self._image_bytes((2, 2, 2)),
+                    },
+                    {"output_name": "named"},
+                )
+
+            self.assertEqual(result, sentinel)
+            core.assert_called_once()
+            load.assert_not_called()
+            self.assertEqual(captured["view_names"], ["front", "left", "right"])
+            self.assertEqual(captured["params"], {"output_name": "named"})
+            self.assertEqual(
+                captured["files"],
+                {"input/front.png", "input/left.png", "input/right.png"},
+            )
+            self.assertEqual(list(outputs.iterdir()), [])
+
+    def test_legacy_generate_routes_remain_present(self):
+        image = self._image_bytes()
+        params = {"output_name": "legacy"}
+        gen = generator.Pi3Generator(outputs_dir=Path(tempfile.gettempdir()) / "unused")
+
+        with mock.patch.object(gen, "_generate_pi3", return_value=Path("/tmp/pi3.glb")) as pi3:
+            self.assertEqual(gen.generate(image, params), Path("/tmp/pi3.glb"))
+            pi3.assert_called_once_with(image, params, None, None)
+
+        gen.node_id = "pi3x"
+        with mock.patch.object(gen, "_generate_pi3x", return_value=Path("/tmp/pi3x.glb")) as pi3x:
+            self.assertEqual(gen.generate(image, params), Path("/tmp/pi3x.glb"))
+            pi3x.assert_called_once_with(image, params, None, None)
 
     def test_side_images_are_secure_and_ordered(self):
         with tempfile.TemporaryDirectory() as temp:

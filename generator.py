@@ -91,6 +91,8 @@ NODE_CONFIGS: Mapping[str, NodeConfig] = MappingProxyType(
 )
 
 PI3X_OMITTED_MULTIMODAL_PREFIXES = ("depth_encoder.", "depth_emb", "ray_embed.", "pose_inject_blk.")
+PI3X_VIEW_ORDER = ("front", "left", "back", "right")
+PI3X_VIEW_PORTS = frozenset(PI3X_VIEW_ORDER)
 SIDE_VIEW_PARAMS = (("left", "left_image_path"), ("back", "back_image_path"), ("right", "right_image_path"))
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 
@@ -511,6 +513,39 @@ def _prepare_pi3x_views(
     for view_name, source in view_sources:
         _raise_if_cancelled(cancel_evt)
         _save_rgb_png(source, input_dir / f"{view_name}.png", f"pi3/pi3x {view_name} input")
+        view_names.append(view_name)
+    return view_names
+
+
+def _prepare_pi3x_named_views(
+    named_images: Mapping[str, bytes],
+    input_dir: Path,
+    cancel_evt: Any | None = None,
+) -> list[str]:
+    if not isinstance(named_images, Mapping):
+        raise TypeError("pi3/pi3x generate_v2 requires named_images to be a mapping of port names to bytes.")
+
+    unknown_ports = [port for port in named_images if port not in PI3X_VIEW_PORTS]
+    if unknown_ports:
+        expected = ", ".join(PI3X_VIEW_ORDER)
+        unknown = ", ".join(sorted(repr(port) for port in unknown_ports))
+        raise ValueError(f"pi3/pi3x generate_v2 rejected unknown image ports: {unknown}. Expected: {expected}.")
+
+    front = named_images.get("front")
+    if front is None or front == b"":
+        raise ValueError("pi3/pi3x generate_v2 requires a non-empty front image.")
+
+    view_names: list[str] = []
+    for view_name in PI3X_VIEW_ORDER:
+        if view_name not in named_images:
+            continue
+        image_bytes = named_images[view_name]
+        if not isinstance(image_bytes, bytes):
+            raise TypeError(f"pi3/pi3x generate_v2 rejected {view_name}: image value must be bytes.")
+        if not image_bytes:
+            raise ValueError(f"pi3/pi3x generate_v2 rejected {view_name}: image bytes must be non-empty.")
+        _raise_if_cancelled(cancel_evt)
+        _save_rgb_png(io.BytesIO(image_bytes), input_dir / f"{view_name}.png", f"pi3/pi3x {view_name} input")
         view_names.append(view_name)
     return view_names
 
@@ -1006,12 +1041,12 @@ class Pi3Generator(BaseGenerator):
         image_bytes: bytes,
         params: Mapping[str, Any] | None,
         progress_cb: Callable[..., Any] | None = None,
-        cancel_evt: Any | None = None,
+        cancel_event: Any | None = None,
     ) -> Path:
         config = self._node_config()
         if config.node_id == "generate":
-            return self._generate_pi3(image_bytes, params, progress_cb, cancel_evt)
-        return self._generate_pi3x(image_bytes, params, progress_cb, cancel_evt)
+            return self._generate_pi3(image_bytes, params, progress_cb, cancel_event)
+        return self._generate_pi3x(image_bytes, params, progress_cb, cancel_event)
 
     def _generate_pi3(
         self,
@@ -1074,7 +1109,7 @@ class Pi3Generator(BaseGenerator):
         output_base = _sanitize_output_base(_param(params, defaults, "output_name", "pi3_point_cloud"))
 
         device = next(self._model.parameters()).device
-        _progress(progress_cb, 30, "Preprocessing image")
+        _progress(progress_cb, 60, "Preprocessing image")
         _raise_if_cancelled(cancel_evt)
         imgs = _load_prepared_views(
             load_images_as_tensor,
@@ -1092,7 +1127,7 @@ class Pi3Generator(BaseGenerator):
             f"with pixel_limit={pixel_limit}, confidence_threshold={confidence_threshold}, "
             f"edge_filter={edge_filter}, edge_rtol={edge_rtol}."
         )
-        _progress(progress_cb, 55, "Running Pi3 inference")
+        _progress(progress_cb, 70, "Running Pi3 inference")
         _raise_if_cancelled(cancel_evt)
         _dtype_value = None
         if self._device_label == "cuda" and self._dtype_label in {"bfloat16", "float16"}:
@@ -1105,7 +1140,7 @@ class Pi3Generator(BaseGenerator):
             else:
                 result = self._model(imgs[None])
 
-        _progress(progress_cb, 80, "Filtering point cloud")
+        _progress(progress_cb, 82, "Filtering point cloud")
         _raise_if_cancelled(cancel_evt)
         masks = torch.sigmoid(result["conf"][..., 0]) > confidence_threshold
         if edge_filter:
@@ -1159,192 +1194,227 @@ class Pi3Generator(BaseGenerator):
         cancel_evt: Any | None = None,
     ) -> Path:
         params = params or {}
-        config = self._node_config()
-        defaults = _schema_defaults(config.node_id)
         if not image_bytes:
             raise ValueError("pi3/pi3x requires non-empty front image bytes.")
 
         with _staged_run(self.outputs_dir, "pi3x") as run:
             run_dir = run.staging_dir
             input_dir = run_dir / "input"
-            stage_dir = run_dir
             _log("pi3/pi3x: starting multi-view generation.")
             _progress(progress_cb, 2, "Preparing pi3/pi3x views")
             _raise_if_cancelled(cancel_evt)
             view_names = _prepare_pi3x_views(image_bytes, params, input_dir, cancel_evt)
             selected_ports = list(view_names)
             _log(f"pi3/pi3x: selected views {view_names}; workflow ports {selected_ports}.")
+            return self._generate_pi3x_in_run_dir(run, view_names, params, progress_cb, cancel_evt)
 
-            missing = _missing_dependencies()
-            if missing:
-                raise RuntimeError(
-                    "pi3/pi3x runtime dependencies are missing: " + ", ".join(missing) + ". Run extension setup first."
-                )
+    def generate_v2(
+        self,
+        named_images: dict[str, bytes],
+        params: Mapping[str, Any] | None,
+        progress_cb: Callable[..., Any] | None = None,
+        cancel_event: Any | None = None,
+    ) -> Path:
+        params = params or {}
+        config = self._node_config()
+        if config.node_id != "pi3x":
+            raise ValueError("generate_v2 is available only for pi3/pi3x.")
 
-            _progress(progress_cb, 12, "Loading pi3/pi3x model")
-            _raise_if_cancelled(cancel_evt)
-            self.load(params=params, progress_cb=progress_cb, cancel_evt=cancel_evt)
-            if self._model is None:
-                raise RuntimeError("pi3/pi3x model failed to load.")
+        with _staged_run(self.outputs_dir, "pi3x") as run:
+            run_dir = run.staging_dir
+            input_dir = run_dir / "input"
+            _log("pi3/pi3x: starting named multi-view generation.")
+            _progress(progress_cb, 2, "Preparing pi3/pi3x views")
+            _raise_if_cancelled(cancel_event)
+            view_names = _prepare_pi3x_named_views(named_images, input_dir, cancel_event)
+            selected_ports = list(view_names)
+            _log(f"pi3/pi3x: selected views {view_names}; workflow ports {selected_ports}.")
+            return self._generate_pi3x_in_run_dir(run, view_names, params, progress_cb, cancel_event)
 
-            import numpy as np
-            import torch
+    def _generate_pi3x_in_run_dir(
+        self,
+        run: _RunDirectory,
+        view_names: list[str],
+        params: Mapping[str, Any],
+        progress_cb: Callable[..., Any] | None,
+        cancel_evt: Any | None,
+    ) -> Path:
+        config = self._node_config()
+        defaults = _schema_defaults(config.node_id)
+        run_dir = run.staging_dir
+        input_dir = run_dir / "input"
+        stage_dir = run_dir
 
-            _ensure_vendor_import_path()
-            with contextlib.redirect_stdout(sys.stderr):
-                from pi3.utils.basic import load_images_as_tensor, write_ply
-                from pi3.utils.geometry import depth_normal_edge, recover_intrinsic_from_rays_d
+        missing = _missing_dependencies()
+        if missing:
+            raise RuntimeError(
+                "pi3/pi3x runtime dependencies are missing: " + ", ".join(missing) + ". Run extension setup first."
+            )
 
-            pixel_limit = _safe_int(
-                _param(params, defaults, "pixel_limit", 255000), 255000, minimum=196, maximum=1200000
-            )
-            confidence_threshold = _safe_float(
-                _param(params, defaults, "confidence_threshold", 0.1), 0.1, minimum=0.0, maximum=1.0
-            )
-            edge_rtol = _safe_float(
-                _param(params, defaults, "edge_rtol", 0.03), 0.03, minimum=0.0, maximum=0.25
-            )
-            edge_filter = _safe_bool(_param(params, defaults, "edge_filter", "true"), True)
-            output_base = _sanitize_output_base(
-                _param(params, defaults, "output_name", config.default_name)
-            )
-            device = next(self._model.parameters()).device
-            _progress(progress_cb, 32, "Preprocessing pi3/pi3x views")
-            _raise_if_cancelled(cancel_evt)
-            imgs = _load_prepared_views(
-                load_images_as_tensor,
-                input_dir,
-                view_names,
-                pixel_limit,
-                cancel_evt,
-            )
-            if not getattr(imgs, "numel", lambda: 0)():
-                raise RuntimeError("pi3/pi3x could not load the selected views into a tensor.")
-            if int(imgs.shape[0]) != len(view_names):
-                raise RuntimeError(
-                    f"pi3/pi3x loaded {int(imgs.shape[0])} views but expected {len(view_names)} ({view_names})."
-                )
-            imgs = imgs.to(device)
+        _progress(progress_cb, 12, "Loading pi3/pi3x model")
+        _raise_if_cancelled(cancel_evt)
+        self.load(params=params, progress_cb=progress_cb, cancel_evt=cancel_evt)
+        if self._model is None:
+            raise RuntimeError("pi3/pi3x model failed to load.")
 
-            _log(
-                "pi3/pi3x: running image-only inference "
-                f"for {view_names}, pixel_limit={pixel_limit}, confidence_threshold={confidence_threshold}, "
-                f"edge_filter={edge_filter}, edge_rtol={edge_rtol}."
+        import numpy as np
+        import torch
+
+        _ensure_vendor_import_path()
+        with contextlib.redirect_stdout(sys.stderr):
+            from pi3.utils.basic import load_images_as_tensor, write_ply
+            from pi3.utils.geometry import depth_normal_edge, recover_intrinsic_from_rays_d
+
+        pixel_limit = _safe_int(
+            _param(params, defaults, "pixel_limit", 255000), 255000, minimum=196, maximum=1200000
+        )
+        confidence_threshold = _safe_float(
+            _param(params, defaults, "confidence_threshold", 0.1), 0.1, minimum=0.0, maximum=1.0
+        )
+        edge_rtol = _safe_float(
+            _param(params, defaults, "edge_rtol", 0.03), 0.03, minimum=0.0, maximum=0.25
+        )
+        edge_filter = _safe_bool(_param(params, defaults, "edge_filter", "true"), True)
+        output_base = _sanitize_output_base(
+            _param(params, defaults, "output_name", config.default_name)
+        )
+        device = next(self._model.parameters()).device
+        _progress(progress_cb, 60, "Preprocessing pi3/pi3x views")
+        _raise_if_cancelled(cancel_evt)
+        imgs = _load_prepared_views(
+            load_images_as_tensor,
+            input_dir,
+            view_names,
+            pixel_limit,
+            cancel_evt,
+        )
+        if not getattr(imgs, "numel", lambda: 0)():
+            raise RuntimeError("pi3/pi3x could not load the selected views into a tensor.")
+        if int(imgs.shape[0]) != len(view_names):
+            raise RuntimeError(
+                f"pi3/pi3x loaded {int(imgs.shape[0])} views but expected {len(view_names)} ({view_names})."
             )
-            _progress(progress_cb, 55, "Running pi3/pi3x inference")
-            _raise_if_cancelled(cancel_evt)
-            dtype_value = None
-            if self._device_label == "cuda" and self._dtype_label in {"bfloat16", "float16"}:
-                dtype_value = torch.bfloat16 if self._dtype_label == "bfloat16" else torch.float16
-            with torch.no_grad():
-                if self._device_label == "cuda" and dtype_value is not None:
-                    with torch.amp.autocast("cuda", dtype=dtype_value):
-                        result = self._model(imgs[None])
-                else:
+        imgs = imgs.to(device)
+
+        _log(
+            "pi3/pi3x: running image-only inference "
+            f"for {view_names}, pixel_limit={pixel_limit}, confidence_threshold={confidence_threshold}, "
+            f"edge_filter={edge_filter}, edge_rtol={edge_rtol}."
+        )
+        _progress(progress_cb, 70, "Running pi3/pi3x inference")
+        _raise_if_cancelled(cancel_evt)
+        dtype_value = None
+        if self._device_label == "cuda" and self._dtype_label in {"bfloat16", "float16"}:
+            dtype_value = torch.bfloat16 if self._dtype_label == "bfloat16" else torch.float16
+        with torch.no_grad():
+            if self._device_label == "cuda" and dtype_value is not None:
+                with torch.amp.autocast("cuda", dtype=dtype_value):
                     result = self._model(imgs[None])
+            else:
+                result = self._model(imgs[None])
 
-            _progress(progress_cb, 78, "Filtering pi3/pi3x point cloud")
-            _raise_if_cancelled(cancel_evt)
-            required_outputs = {"points", "local_points", "rays", "conf", "camera_poses", "metric"}
-            missing_outputs = sorted(required_outputs.difference(result))
-            if missing_outputs:
-                raise RuntimeError("pi3/pi3x inference omitted required outputs: " + ", ".join(missing_outputs))
+        _progress(progress_cb, 82, "Filtering pi3/pi3x point cloud")
+        _raise_if_cancelled(cancel_evt)
+        required_outputs = {"points", "local_points", "rays", "conf", "camera_poses", "metric"}
+        missing_outputs = sorted(required_outputs.difference(result))
+        if missing_outputs:
+            raise RuntimeError("pi3/pi3x inference omitted required outputs: " + ", ".join(missing_outputs))
 
-            for output_name in required_outputs:
-                _validate_finite_array(output_name, result[output_name], positive=output_name == "metric")
+        for output_name in required_outputs:
+            _validate_finite_array(output_name, result[output_name], positive=output_name == "metric")
 
-            confidence_logits = result["conf"][0, ..., 0].float()
-            confidence = torch.sigmoid(confidence_logits)
-            valid_mask = confidence > confidence_threshold
-            if edge_filter:
-                edges = depth_normal_edge(result["local_points"][0], rtol=edge_rtol, mask=valid_mask)
-                valid_mask = torch.logical_and(valid_mask, ~edges)
-            _raise_if_cancelled(cancel_evt)
-            intrinsics = recover_intrinsic_from_rays_d(result["rays"][0].float())
-            colors_tensor = imgs.permute(0, 2, 3, 1).float()
-            points = result["points"][0][valid_mask]
-            colors = colors_tensor[valid_mask]
-            retained_points = int(points.shape[0])
-            _log(f"pi3/pi3x: retained {retained_points} points after filtering.")
-            if points.numel() == 0:
-                raise RuntimeError(
-                    "pi3/pi3x produced zero retained points. Lower confidence_threshold or disable edge_filter."
-                )
-
-            arrays = {
-                "points": np.asarray(_tensor_to_numpy(result["points"][0]), dtype=np.float32),
-                "local_points": np.asarray(_tensor_to_numpy(result["local_points"][0]), dtype=np.float32),
-                "rays": np.asarray(_tensor_to_numpy(result["rays"][0]), dtype=np.float32),
-                "depth": np.asarray(_tensor_to_numpy(result["local_points"][0, ..., 2]), dtype=np.float32),
-                "confidence_logits": np.asarray(_tensor_to_numpy(confidence_logits), dtype=np.float32),
-                "confidence": np.asarray(_tensor_to_numpy(confidence), dtype=np.float32),
-                "valid_mask": np.asarray(_tensor_to_numpy(valid_mask), dtype=bool),
-                "camera_poses": np.asarray(_tensor_to_numpy(result["camera_poses"][0]), dtype=np.float32),
-                "intrinsics": np.asarray(_tensor_to_numpy(intrinsics), dtype=np.float32),
-                "metric": np.asarray(_tensor_to_numpy(result["metric"][0]), dtype=np.float32),
-                "colors": np.asarray(_tensor_to_numpy(colors_tensor), dtype=np.float32),
-            }
-            _validate_pi3x_arrays(arrays)
-            bundle_base = output_base
-            stage_glb = stage_dir / f"{bundle_base}.glb"
-            stage_ply = stage_dir / f"{bundle_base}.ply"
-            points_cpu = points.detach().cpu()
-            colors_cpu = colors.detach().cpu()
-            _progress(progress_cb, 86, "Writing pi3/pi3x PLY")
-            _raise_if_cancelled(cancel_evt)
-            with contextlib.redirect_stdout(sys.stderr):
-                write_ply(points_cpu, colors_cpu, str(stage_ply))
-            _progress(progress_cb, 89, "Writing pi3/pi3x GLB preview")
-            _raise_if_cancelled(cancel_evt)
-            _write_point_cloud_glb(points_cpu, colors_cpu, stage_glb)
-
-            filenames = {
-                "glb": stage_glb.name,
-                "ply": stage_ply.name,
-                "npz": f"{bundle_base}_pi3x.npz",
-                "metadata": f"{bundle_base}_metadata.json",
-                "depth_previews": [f"{bundle_base}_depth_{name}.png" for name in view_names],
-                "confidence_previews": [f"{bundle_base}_confidence_{name}.png" for name in view_names],
-            }
-            metadata: dict[str, Any] = {
-                "extension_id": EXTENSION_ID,
-                "node_id": config.node_id,
-                "model_id": config.model_id,
-                "hf_repo": config.hf_repo,
-                "view_names": view_names,
-                "tensor_shapes": {key: list(value.shape) for key, value in arrays.items()},
-                "camera_poses": arrays["camera_poses"].tolist(),
-                "recovered_intrinsics": arrays["intrinsics"].tolist(),
-                "metric": {
-                    "value": float(np.asarray(arrays["metric"]).reshape(-1)[0]),
-                    "label": "approximate",
-                },
-                "confidence_threshold": confidence_threshold,
-                "edge_filter": edge_filter,
-                "edge_rtol": edge_rtol,
-                "pixel_limit": pixel_limit,
-                "retained_point_count": retained_points,
-                "filenames": filenames,
-            }
-            _write_pi3x_sidecars(
-                stage_dir,
-                bundle_base,
-                arrays=arrays,
-                metadata=metadata,
-                view_names=view_names,
-                cancel_evt=cancel_evt,
-                progress_cb=progress_cb,
+        confidence_logits = result["conf"][0, ..., 0].float()
+        confidence = torch.sigmoid(confidence_logits)
+        valid_mask = confidence > confidence_threshold
+        if edge_filter:
+            edges = depth_normal_edge(result["local_points"][0], rtol=edge_rtol, mask=valid_mask)
+            valid_mask = torch.logical_and(valid_mask, ~edges)
+        _raise_if_cancelled(cancel_evt)
+        intrinsics = recover_intrinsic_from_rays_d(result["rays"][0].float())
+        colors_tensor = imgs.permute(0, 2, 3, 1).float()
+        points = result["points"][0][valid_mask]
+        colors = colors_tensor[valid_mask]
+        retained_points = int(points.shape[0])
+        _log(f"pi3/pi3x: retained {retained_points} points after filtering.")
+        if points.numel() == 0:
+            raise RuntimeError(
+                "pi3/pi3x produced zero retained points. Lower confidence_threshold or disable edge_filter."
             )
 
-            expected_names = _pi3x_bundle_names(bundle_base, view_names)
-            expected_files = [f"input/{name}.png" for name in view_names] + expected_names
-            glb_name = f"{bundle_base}.glb"
-            _progress(progress_cb, 98, "Publishing complete pi3/pi3x run")
-            _raise_if_cancelled(cancel_evt)
-            _log(
-                f"pi3/pi3x: publishing complete run {run.final_dir} "
-                f"with {len(expected_names) - 1} sidecars."
-            )
-            result_path = _publish_run_directory(run, expected_files, glb_name, cancel_evt)
-            _progress(progress_cb, 100, "pi3/pi3x run published")
-            return result_path
+        arrays = {
+            "points": np.asarray(_tensor_to_numpy(result["points"][0]), dtype=np.float32),
+            "local_points": np.asarray(_tensor_to_numpy(result["local_points"][0]), dtype=np.float32),
+            "rays": np.asarray(_tensor_to_numpy(result["rays"][0]), dtype=np.float32),
+            "depth": np.asarray(_tensor_to_numpy(result["local_points"][0, ..., 2]), dtype=np.float32),
+            "confidence_logits": np.asarray(_tensor_to_numpy(confidence_logits), dtype=np.float32),
+            "confidence": np.asarray(_tensor_to_numpy(confidence), dtype=np.float32),
+            "valid_mask": np.asarray(_tensor_to_numpy(valid_mask), dtype=bool),
+            "camera_poses": np.asarray(_tensor_to_numpy(result["camera_poses"][0]), dtype=np.float32),
+            "intrinsics": np.asarray(_tensor_to_numpy(intrinsics), dtype=np.float32),
+            "metric": np.asarray(_tensor_to_numpy(result["metric"][0]), dtype=np.float32),
+            "colors": np.asarray(_tensor_to_numpy(colors_tensor), dtype=np.float32),
+        }
+        _validate_pi3x_arrays(arrays)
+        bundle_base = output_base
+        stage_glb = stage_dir / f"{bundle_base}.glb"
+        stage_ply = stage_dir / f"{bundle_base}.ply"
+        points_cpu = points.detach().cpu()
+        colors_cpu = colors.detach().cpu()
+        _progress(progress_cb, 86, "Writing pi3/pi3x PLY")
+        _raise_if_cancelled(cancel_evt)
+        with contextlib.redirect_stdout(sys.stderr):
+            write_ply(points_cpu, colors_cpu, str(stage_ply))
+        _progress(progress_cb, 89, "Writing pi3/pi3x GLB preview")
+        _raise_if_cancelled(cancel_evt)
+        _write_point_cloud_glb(points_cpu, colors_cpu, stage_glb)
+
+        filenames = {
+            "glb": stage_glb.name,
+            "ply": stage_ply.name,
+            "npz": f"{bundle_base}_pi3x.npz",
+            "metadata": f"{bundle_base}_metadata.json",
+            "depth_previews": [f"{bundle_base}_depth_{name}.png" for name in view_names],
+            "confidence_previews": [f"{bundle_base}_confidence_{name}.png" for name in view_names],
+        }
+        metadata: dict[str, Any] = {
+            "extension_id": EXTENSION_ID,
+            "node_id": config.node_id,
+            "model_id": config.model_id,
+            "hf_repo": config.hf_repo,
+            "view_names": view_names,
+            "tensor_shapes": {key: list(value.shape) for key, value in arrays.items()},
+            "camera_poses": arrays["camera_poses"].tolist(),
+            "recovered_intrinsics": arrays["intrinsics"].tolist(),
+            "metric": {
+                "value": float(np.asarray(arrays["metric"]).reshape(-1)[0]),
+                "label": "approximate",
+            },
+            "confidence_threshold": confidence_threshold,
+            "edge_filter": edge_filter,
+            "edge_rtol": edge_rtol,
+            "pixel_limit": pixel_limit,
+            "retained_point_count": retained_points,
+            "filenames": filenames,
+        }
+        _write_pi3x_sidecars(
+            stage_dir,
+            bundle_base,
+            arrays=arrays,
+            metadata=metadata,
+            view_names=view_names,
+            cancel_evt=cancel_evt,
+            progress_cb=progress_cb,
+        )
+
+        expected_names = _pi3x_bundle_names(bundle_base, view_names)
+        expected_files = [f"input/{name}.png" for name in view_names] + expected_names
+        glb_name = f"{bundle_base}.glb"
+        _progress(progress_cb, 98, "Publishing complete pi3/pi3x run")
+        _raise_if_cancelled(cancel_evt)
+        _log(
+            f"pi3/pi3x: publishing complete run {run.final_dir} "
+            f"with {len(expected_names) - 1} sidecars."
+        )
+        result_path = _publish_run_directory(run, expected_files, glb_name, cancel_evt)
+        _progress(progress_cb, 100, "pi3/pi3x run published")
+        return result_path

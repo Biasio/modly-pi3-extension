@@ -7,6 +7,14 @@ This extension exposes two independent model nodes through one generator class:
 
 Both nodes return a GLB artifact containing glTF `POINTS` for the Modly viewer and retain a raw PLY beside it. These are point clouds, not textured meshes: there is no mesh topology, PBR material, or textured geometry.
 
+## Installation
+
+In Modly, open **Models/Extensions → Install from GitHub** and enter:
+
+`https://github.com/DrHepa/modly-pi3-extension`
+
+Run **Setup** or **Repair** to prepare the extension environment. Then download the Pi3 and Pi3X weights independently from the **Models** UI. Setup does not download model weights.
+
 ## Model weights
 
 `setup.py` prepares required shared dependencies and prefers FlashAttention acceleration, but never downloads weights. Use Modly's Models UI to download each node independently:
@@ -18,20 +26,22 @@ Both nodes return a GLB artifact containing glTF `POINTS` for the Modly viewer a
 
 Both Pi3 and Pi3X model weights are licensed CC-BY-NC-4.0 and are strictly noncommercial. Older Pi3 Hugging Face metadata may still report BSD-2; this extension follows the current upstream repository's explicit model-weight terms. The extension does not mix or redistribute the repositories or checkpoints.
 
-## Pi3X named image ports
+## Usage
 
-Pi3X keeps the legacy node-level `"input": "image"` selector required by Modly's image-generation API, while the workflow node exposes four named image ports:
+Stable Modly hosts use the legacy image generation contract: connect one front image to the node-level `"input": "image"` field and the host calls `generate(image_bytes, params, progress_cb, cancel_event)`. This remains unchanged for `pi3/generate`, and Pi3X also supports a front-only legacy run through the same route.
+
+Hosts that support the `named-v1` IO contract can call Pi3X through `generate_v2(named_images, params, progress_cb, cancel_event)` and connect named image ports:
 
 - `front`: **Front RGB Image**, required.
 - `left`: **Left RGB Image**, optional.
 - `back`: **Back RGB Image**, optional.
 - `right`: **Right RGB Image**, optional.
 
-Use RGB views of the same subject. Supplied views are normalized to RGB PNG and processed deterministically as front, left, back, right; any side may be omitted, so a front-only run is valid. Modly currently transports optional side ports internally as `left_image_path`, `back_image_path`, and `right_image_path`. These are not user parameters. Until Modly core stages external side files, each side source must resolve to a regular PNG, JPEG, or WebP file inside the configured `WORKSPACE_DIR`; traversal and symlink escapes are rejected.
+Use RGB views of the same subject. Supplied views are normalized to RGB PNG and processed deterministically as front, left, back, right; any side may be omitted, so a front-only run is valid.
 
 Predicted depth, camera poses, rays, intrinsics, confidence, and NPZ data are outputs only. They are never exposed as Pi3X inputs.
 
-## Per-run output directories
+## Outputs
 
 Modly passes the collection root (normally `Workflows/`) as `outputs_dir`. The extension creates one unique run directory per generation and returns the nested GLB:
 
@@ -58,7 +68,7 @@ Workflows/
 
 `output_name` controls only `<name>` inside the unique run directory; it cannot select or escape the run directory. Inputs and every generated artifact are written to a hidden staging directory first. After validation, the complete directory is published with one same-filesystem atomic rename, so concurrent calls produce distinct complete runs and failures or cancellations expose no partial run.
 
-Pi3X sidecars contain:
+Pi3X sidecars are generated outputs only and are not input ports. They contain:
 
 - `<name>_pi3x.npz`: float/native arrays for points, local points, rays, metric depth, confidence logits and sigmoid confidence, valid mask, camera poses, recovered intrinsics, colors, and ordered view names.
 - `<name>_metadata.json`: model/node identity, shapes, poses, intrinsics, approximate metric scale, filtering settings, retained count, relative artifact basenames, and depth-preview normalization bounds.
@@ -66,6 +76,12 @@ Pi3X sidecars contain:
 - `<name>_confidence_<view>.png`: per-view sigmoid confidence mapped linearly to 8-bit.
 
 Sidecars are documented files, not additional Modly output ports. Pi3X's predicted metric scale is approximate and should not be treated as calibrated measurement.
+
+## Requirements and compatibility
+
+Setup prepares the required Python and CUDA dependencies. CUDA is recommended.
+
+Stable Modly hosts support front-view input only. Named multi-view input requires a host that implements the `named-v1` contract, such as the paired Modly development host or a newer compatible host. No platform compatibility is claimed without validation on that platform.
 
 ## Setup
 
@@ -101,6 +117,26 @@ Both nodes use the same validated bounds and controls for `pixel_limit`, `confid
 
 CUDA is strongly recommended. CPU execution is valid but can be extremely slow and memory-heavy.
 
-## Licensing
+## Limitations
+
+- Outputs are point clouds, not meshes.
+- Metric scale is approximate.
+- Multi-view images should show the same subject.
+- PyTorch SDPA fallback may be slower and use more VRAM than FlashAttention.
+
+## Troubleshooting
+
+- **Missing weights:** Open the Modly **Models** UI and download the weights for the correct Pi3 or Pi3X node.
+- **FlashAttention installation or loading fails:** FlashAttention is optional; inference continues with PyTorch SDPA.
+- **The output contains zero points:** Lower the confidence threshold or disable the edge filter.
+- **Setup reports a fatal required-dependency or CUDA smoke-test failure:** Inspect the setup log, fix the reported environment issue, and run **Repair**.
+
+## Credits
+
+- Modly extension by [DrHepa](https://github.com/DrHepa): [modly-pi3-extension](https://github.com/DrHepa/modly-pi3-extension).
+- Pi3 and Pi3X by [yyfz](https://github.com/yyfz): [Pi3 repository](https://github.com/yyfz/Pi3) and [Hugging Face](https://huggingface.co/yyfz233).
+- Modly by Lightning Pixel.
+
+## License
 
 The extension wrapper remains MIT-licensed. Vendored Pi3 and Pi3X upstream source code remains BSD-3-Clause with existing file-level notices. The separately distributed Pi3 and Pi3X model weights are CC-BY-NC-4.0 and strictly noncommercial; older Pi3 Hugging Face metadata may still report BSD-2, but the extension follows the current upstream repository's explicit weight terms. See [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
