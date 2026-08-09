@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+import platform
 
 EXTENSION_ID = "pi3"
 NODE_ID = "generate"
@@ -46,6 +47,9 @@ BLACKWELL_TORCH_PACKAGES = [
     f"torch=={BLACKWELL_TORCH_VERSION}",
     f"torchvision=={BLACKWELL_TORCHVISION_VERSION}",
 ]
+AARCH64_CPU_TORCH_VERSION = "2.12.1"
+AARCH64_CPU_TORCHVISION_VERSION = "0.27.1"
+AARCH64_CPU_TORCH_PACKAGES = [f"torch=={AARCH64_CPU_TORCH_VERSION}", f"torchvision=={AARCH64_CPU_TORCHVISION_VERSION}"]
 TORCH_REQUIREMENT_NAMES = {"torch", "torchvision"}
 PYTORCH_CPU_INDEX_URL = "https://download.pytorch.org/whl/cpu"
 PYTORCH_CUDA_INDEX_URLS = {
@@ -524,6 +528,24 @@ def select_torch_install_plan(config: SetupConfig) -> dict[str, Any]:
     torchvision_version = DEFAULT_TORCHVISION_VERSION
     packages = DEFAULT_TORCH_PACKAGES
     note = "No CUDA signal was provided; selecting the explicit PyTorch CPU wheel index."
+
+    is_aarch64 = platform.machine().lower() in {"aarch64", "arm64"}
+
+    if is_aarch64 and not cuda_expected:
+        return {
+            "cuda_expected": cuda_expected,
+            "cuda_signals": cuda_signals,
+            "lane": "cpu",
+            "index_url": PYTORCH_CPU_INDEX_URL,
+            "packages": AARCH64_CPU_TORCH_PACKAGES,
+            "torch_version": AARCH64_CPU_TORCH_VERSION,
+            "torchvision_version": AARCH64_CPU_TORCHVISION_VERSION,
+            "note": (
+                f"Detected aarch64 host without Blackwell gpu_sm/cuda_version; "
+                f"forcing CPU lane with torch=={AARCH64_CPU_TORCH_VERSION} / "
+                f"torchvision=={AARCH64_CPU_TORCHVISION_VERSION}."
+            ),
+        }
 
     if cuda_expected:
         blackwell_required = (
