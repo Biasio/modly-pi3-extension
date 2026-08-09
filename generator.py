@@ -137,6 +137,14 @@ def _load_manifest() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _node_id_from_model_dir(model_dir: Path) -> str | None:
+    owner_dir = model_dir.parent if model_dir.name == DOWNLOAD_CHECK else model_dir
+    node_id = owner_dir.name
+    if owner_dir.parent.name == EXTENSION_ID and node_id in NODE_CONFIGS:
+        return node_id
+    return None
+
+
 def _runtime_schema_node_id(environ: Mapping[str, str] | None = None) -> str:
     """Resolve the ready-handshake schema owner without mutating generator state."""
     process_env = os.environ if environ is None else environ
@@ -150,10 +158,8 @@ def _runtime_schema_node_id(environ: Mapping[str, str] | None = None) -> str:
 
     model_dir = process_env.get("MODEL_DIR")
     if isinstance(model_dir, str) and model_dir:
-        path = Path(model_dir)
-        owner_dir = path.parent if path.name == DOWNLOAD_CHECK else path
-        node_id = owner_dir.name
-        if owner_dir.parent.name == EXTENSION_ID and node_id in NODE_CONFIGS:
+        node_id = _node_id_from_model_dir(Path(model_dir))
+        if node_id:
             return node_id
 
     return NODE_ID
@@ -778,7 +784,10 @@ class Pi3Generator(BaseGenerator):
         self._loaded_node_id: str | None = None
         self._device_label: str | None = None
         self._dtype_label: str | None = None
-        self.node_id = getattr(self, "node_id", NODE_ID)
+        inferred_node_id = (
+            _node_id_from_model_dir(self.model_dir) if provided_model_dir else None
+        )
+        self.node_id = getattr(self, "node_id", inferred_node_id or NODE_ID)
 
     def _node_config(self) -> NodeConfig:
         node_id = str(getattr(self, "node_id", NODE_ID) or NODE_ID)
